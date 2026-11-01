@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDownLeft, ArrowUpRight, Banknote, Plus, Receipt, RotateCcw, Wallet } from 'lucide-react';
-import { apiDelete, apiGet, apiGetWithMeta, apiList, apiPatch, apiPost, idempotencyKey, type ListMeta } from '../lib/api';
+import { apiDelete, apiGet, apiGetWithMeta, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, todayIst } from '../lib/format';
 import {
@@ -152,6 +153,10 @@ export default function Finance() {
     void queryClient.invalidateQueries({ queryKey: ['expenses'] });
     void queryClient.invalidateQueries({ queryKey: ['finance-summary'] });
     void queryClient.invalidateQueries({ queryKey: ['customer-ledger'] });
+    void queryClient.invalidateQueries({ queryKey: ['customers'] });
+    void queryClient.invalidateQueries({ queryKey: ['supplier-ledger'] });
+    void queryClient.invalidateQueries({ queryKey: ['suppliers'] });
+    void queryClient.invalidateQueries({ queryKey: ['reconciliation'] });
     void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
   };
 
@@ -379,25 +384,19 @@ function PaymentModal({
   const [mode, setMode] = useState('CASH');
   const [reference, setReference] = useState('');
   const [notes, setNotes] = useState('');
+  const payload = {
+    stationId, direction,
+    partyType: direction === 'RECEIPT' ? 'CUSTOMER' : 'SUPPLIER',
+    customerId: direction === 'RECEIPT' ? customerId : undefined,
+    supplierId: direction === 'PAYOUT' ? supplierId : undefined,
+    amount, mode, reference: reference || undefined, notes: notes || undefined,
+  };
+  const idempotency = useIdempotencyKey('payment', payload);
 
   const mutation = useMutation({
-    mutationFn: () =>
-      apiPost(
-        '/finance/payments',
-        {
-          stationId,
-          direction,
-          partyType: direction === 'RECEIPT' ? 'CUSTOMER' : 'SUPPLIER',
-          customerId: direction === 'RECEIPT' ? customerId : undefined,
-          supplierId: direction === 'PAYOUT' ? supplierId : undefined,
-          amount,
-          mode,
-          reference: reference || undefined,
-          notes: notes || undefined,
-        },
-        idempotencyKey('payment'),
-      ),
+    mutationFn: () => apiPost('/finance/payments', payload, idempotency.key),
     onSuccess: () => {
+      idempotency.reset();
       toast('Payment recorded');
       setAmount('');
       setReference('');
@@ -480,19 +479,15 @@ function ExpenseModal({
   const [amount, setAmount] = useState('');
   const [paidVia, setPaidVia] = useState('CASH');
   const [reference, setReference] = useState('');
-
+  const payload = {
+    stationId, categoryId: categoryId || undefined,
+    description, amount, paidVia, reference: reference || undefined,
+  };
+  const idempotency = useIdempotencyKey('expense', payload);
   const mutation = useMutation({
-    mutationFn: () =>
-      apiPost('/finance/expenses', {
-        stationId,
-        categoryId: categoryId || undefined,
-        categoryName: categories.find((c) => c.id === categoryId)?.name ?? 'General',
-        description,
-        amount,
-        paidVia,
-        reference: reference || undefined,
-      }),
+    mutationFn: () => apiPost('/finance/expenses', payload, idempotency.key),
     onSuccess: () => {
+      idempotency.reset();
       toast('Expense recorded');
       setDescription('');
       setAmount('');
@@ -523,7 +518,7 @@ function ExpenseModal({
         </Field>
         <Field label="Paid via">
           <Select value={paidVia} onChange={(e) => setPaidVia(e.target.value)}>
-            {['CASH', 'UPI', 'CARD', 'BANK', 'CREDIT'].map((m) => <option key={m} value={m}>{m}</option>)}
+            {['CASH', 'UPI', 'CARD', 'BANK', 'CHEQUE'].map((m) => <option key={m} value={m}>{m}</option>)}
           </Select>
         </Field>
         <Field label="Description" required className="sm:col-span-2">

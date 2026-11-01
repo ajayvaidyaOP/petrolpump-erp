@@ -22,11 +22,10 @@ public final class Domain {
             String specificationUsed) {}
 
     /**
-     * Converts observed glass-hydrometer reading (kg/m³) at observed temperature (°C)
-     * to standard density at 15.0°C (kg/m³) per ASTM D1250-80 / ISO 91-1 / IS 1448 [P:16]
-     * Table 53B (Generalized Petroleum Products, soda-lime glass hydrometer calibrated at 15°C),
-     * and evaluates fuel-specific BS-VI specification limits (IS 2796 for Motor Spirit,
-     * IS 1460 retail band for High Speed Diesel).
+     * Legacy thermal-correction estimate for a glass-hydrometer reading. The coefficient set is
+     * retained for backward compatibility, but this build has NOT been certified against ASTM/IS
+     * tables and must not be represented as statutory compliance evidence. The min/max bands are
+     * configurable screening bands only.
      */
     private static final BigDecimal TABLE_53B_MIN_DENSITY = new BigDecimal("653.0");
     private static final BigDecimal TABLE_53B_MAX_DENSITY = new BigDecimal("1075.0");
@@ -44,7 +43,7 @@ public final class Domain {
                 || obsDec.compareTo(TABLE_53B_MAX_DENSITY) > 0) {
             throw ApiException.validation(
                     "observedDensity",
-                    "Observed density must be within ASTM D1250-80 Table 53B valid domain 653.0–1075.0 kg/m³ (e.g. 742.5, not 0.742)");
+                    "Observed density must be within the supported estimate domain 653.0–1075.0 kg/m³ (e.g. 742.5, not 0.742)");
         }
         final BigDecimal tempDec;
         try {
@@ -81,14 +80,14 @@ public final class Domain {
             rho15 = next;
         }
         if (!Double.isFinite(rho15)) {
-            throw ApiException.validation("observedDensity", "Unable to converge ASTM D1250-80 Table 53B density at 15°C");
+            throw ApiException.validation("observedDensity", "Unable to converge the legacy density-at-15°C estimate");
         }
         BigDecimal d15 = BigDecimal.valueOf(rho15).setScale(1, java.math.RoundingMode.HALF_UP);
         if (d15.compareTo(TABLE_53B_MIN_DENSITY) < 0 || d15.compareTo(TABLE_53B_MAX_DENSITY) > 0) {
             throw ApiException.validation(
                     "observedDensity",
                     "Corrected density at 15°C (" + Money.fixed(d15, 1)
-                            + " kg/m³) falls outside ASTM D1250-80 Table 53B valid domain 653.0–1075.0 kg/m³; extrapolation is not permitted");
+                            + " kg/m³) falls outside the supported estimate domain 653.0–1075.0 kg/m³; extrapolation is not permitted");
         }
         String cat = fuelCategory == null ? "" : fuelCategory.trim().toUpperCase();
         String specMin;
@@ -121,12 +120,12 @@ public final class Domain {
     public static String densitySpecificationLabel(String fuelCategory) {
         String cat = fuelCategory == null ? "" : fuelCategory.trim().toUpperCase();
         if ("DIESEL".equals(cat)) {
-            return "ASTM D1250 / IS 1448 [P:16] Table 53B @ 15°C · IS 1460:2017 BS-VI Diesel (810–845 kg/m³)";
+            return "Uncertified legacy thermal estimate @ 15°C · Diesel screening band (810–845 kg/m³), not statutory compliance";
         }
         if ("PETROL".equals(cat)) {
-            return "ASTM D1250 / IS 1448 [P:16] Table 53B @ 15°C · IS 2796:2017 BS-VI Motor Gasoline (720–775 kg/m³)";
+            return "Uncertified legacy thermal estimate @ 15°C · Petrol screening band (720–775 kg/m³), not statutory compliance";
         }
-        return "ASTM D1250 / IS 1448 [P:16] Table 53B @ 15°C · Unsupported fuel category (no BS-VI density spec)";
+        return "Uncertified legacy thermal estimate @ 15°C · Unsupported fuel category (no screening band)";
     }
 
     public static BigDecimal applyCreditEntryDelta(BigDecimal acc, Map<String, Object> entry) {
@@ -182,6 +181,9 @@ public final class Domain {
         if ("ADJUSTMENT".equals(type)) return raw;
         BigDecimal amount = raw.abs();
         if ("DISPENSED".equals(type) || "TRANSFER_OUT".equals(type)) return amount.negate();
+        if (!java.util.Set.of("OPENING", "RECEIVED", "DELIVERY", "TRANSFER_IN").contains(type)) {
+            throw ApiException.validation("type", "Unsupported stock movement type: " + type);
+        }
         return amount;
     }
 
@@ -263,7 +265,25 @@ public final class Domain {
     }
 
     public static String movement(String tenantId, String stationId, String tankId, String productId, String type, String litres, String refType, String refId, String note, String userId, boolean demo) {
+        return movement(tenantId, stationId, tankId, productId, type, litres, refType, refId, note, userId, demo, Clock.nowIso());
+    }
+
+    /** Must run inside the caller's transaction. Locks the tank and rejects negative book stock. */
+    public static String movement(String tenantId, String stationId, String tankId, String productId, String type, String litres, String refType, String refId, String note, String userId, boolean demo, String occurredAt) {
+        Map<String, Object> tank = Db.one("SELECT id, tenant_id, station_id, product_id FROM tanks WHERE id = ? FOR UPDATE", tankId);
+        if (tank == null || !tenantId.equals(Db.str(tank, "tenant_id")) || !stationId.equals(Db.str(tank, "station_id")) || !productId.equals(Db.str(tank, "product_id"))) {
+            throw ApiException.unprocessable("Stock movement tank/product does not belong to this station");
+        }
+        BigDecimal qty = Money.d(litres);
+        if (!Double.isFinite(qty.doubleValue())) throw ApiException.validation("litres", "Stock litres must be finite");
+        if (!"ADJUSTMENT".equals(type) && qty.signum() < 0) throw ApiException.validation("litres", "Stock litres cannot be negative for " + type);
+        BigDecimal delta = signedLitres(type, qty);
+        BigDecimal projected = bookStock(tankId).add(delta);
+        if (projected.signum() < 0) {
+            throw ApiException.conflict("Tank book stock would become negative (" + Money.litres(projected) + " L). Record a delivery/opening stock or investigate before dispensing.");
+        }
         String id = Clock.newId("mov");
+        String now = Clock.nowIso();
         Db.exec(
                 """
                 INSERT INTO stock_movements
@@ -271,13 +291,17 @@ public final class Domain {
                    occurred_at, note, created_by, is_demo, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                id, tenantId, stationId, tankId, productId, type, litres, refType, refId,
-                Clock.nowIso(), note, userId, demo ? 1 : 0, Clock.nowIso());
+                id, tenantId, stationId, tankId, productId, type, Money.litres(qty), refType, refId,
+                occurredAt == null || occurredAt.isBlank() ? now : occurredAt, note, userId, demo ? 1 : 0, now);
         return id;
     }
 
     public static Map<String, Object> priceAt(String tenantId, String productId, String stationId) {
-        String now = Clock.nowIso();
+        return priceAt(tenantId, productId, stationId, Clock.nowIso());
+    }
+
+    public static Map<String, Object> priceAt(String tenantId, String productId, String stationId, String atIso) {
+        String now = atIso == null || atIso.isBlank() ? Clock.nowIso() : atIso;
         Map<String, Object> row = stationId == null ? null : Db.one(
                 """
                 SELECT * FROM fuel_prices

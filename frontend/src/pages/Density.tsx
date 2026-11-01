@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FlaskConical, Plus, RefreshCw, Thermometer, Trash2 } from 'lucide-react';
 import { apiDelete, apiList, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatNumber, todayIst } from '../lib/format';
 import {
@@ -59,7 +60,7 @@ interface ProductOption {
 
 const SPEC: Record<string, [number, number]> = { PETROL: [720, 775], DIESEL: [810, 845] };
 
-function computeAstm53bDensity15c(observedKgM3: number, tempC: number): number {
+function computeLegacyDensity15cEstimate(observedKgM3: number, tempC: number): number {
   const dt = tempC - 15;
   const hyd = 1 - 0.000023 * dt - 0.00000002 * dt * dt;
   const rhoT = observedKgM3 * hyd;
@@ -126,7 +127,7 @@ export default function Density() {
     <>
       <PageHeader
         title="Morning density & temperature register"
-        description={`${station?.name ?? 'Station'} · ASTM 15°C corrected hydrometer log for OMC & Weights-Measures inspections`}
+        description={`${station?.name ?? 'Station'} · Uncertified legacy 15°C density estimate and screening bands — not statutory compliance evidence`}
         actions={
           <>
             <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-auto" aria-label="From date" />
@@ -158,9 +159,9 @@ export default function Density() {
           icon={<FlaskConical className="h-4 w-4" />}
         />
         <StatCard
-          label="Out-of-spec samples"
+          label="Outside screening band"
           value={outOfSpec}
-          hint="Requires sample retention & OMC escalation"
+          hint="Review sample; not a certified compliance result"
           tone={outOfSpec > 0 ? 'warning' : 'success'}
         />
       </div>
@@ -169,7 +170,7 @@ export default function Density() {
         <div className="callout-danger mb-4 flex items-center gap-3">
           <FlaskConical className="h-4 w-4 shrink-0 text-danger" />
           <span>
-            <strong>{outOfSpec} sample(s) outside IS specification</strong> in this date range — retain sealed reference sample and escalate to station manager / OMC field officer immediately.
+            <strong>{outOfSpec} sample(s) outside the configured screening band</strong> in this date range. Retain the sample and review with the station manager; this estimate is not certified ASTM/IS compliance evidence.
           </span>
         </div>
       )}
@@ -177,7 +178,7 @@ export default function Density() {
       <Card>
         <CardHeader
           title="Density inspection log"
-          subtitle="Density @15°C = observed + correction × (temperature − 15). Petrol spec 720–775 kg/m³ · Diesel spec 810–860 kg/m³."
+          subtitle="Legacy thermal estimate @15°C. Screening bands: petrol 720–775 kg/m³ · diesel 810–845 kg/m³. Not certified ASTM/IS compliance."
           action={<Badge tone="accent">{checks.data?.meta.total ?? rows.length} entries</Badge>}
         />
         <TableScrollHint />
@@ -237,11 +238,11 @@ export default function Density() {
                       <td>
                         {Number(row.withinSpec) === 1 ? (
                           <Badge tone="success" dot>
-                            Within spec
+                            Within band
                           </Badge>
                         ) : (
                           <Badge tone="danger" dot>
-                            Out of spec
+                            Outside band
                           </Badge>
                         )}
                       </td>
@@ -327,15 +328,13 @@ function CreateDensityModal({
     const o = Number(observed);
     const t = Number(temp);
     if (!o || o < 653 || o > 1075 || Number.isNaN(t) || t < -20 || t > 65 || observed === '' || temp === '') return null;
-    const at15 = Math.round(computeAstm53bDensity15c(o, t) * 10) / 10;
+    const at15 = Math.round(computeLegacyDensity15cEstimate(o, t) * 10) / 10;
     if (at15 < 653 || at15 > 1075) return null;
     const spec = SPEC[category];
     return { at15: at15.toFixed(1), within: spec ? at15 >= spec[0] && at15 <= spec[1] : false, spec };
   }, [observed, temp, category]);
 
-  const create = useMutation({
-    mutationFn: () =>
-      apiPost('/density', {
+  const densityPayload = {
         stationId,
         tankId,
         businessDate: date,
@@ -343,8 +342,13 @@ function CreateDensityModal({
         observedTempC: temp,
         source,
         note: note || undefined,
-      }),
+      };
+  const densityKey = useIdempotencyKey('density-check', densityPayload);
+  const create = useMutation({
+    mutationFn: () =>
+      apiPost('/density', densityPayload, densityKey.key),
     onSuccess: () => {
+      densityKey.reset();
       toast('Density check saved', { description: preview ? `@15°C: ${preview.at15} kg/m³` : undefined });
       setObserved('');
       setTemp('');
@@ -416,7 +420,7 @@ function CreateDensityModal({
             {preview.spec && (
               <span>
                 {' '}
-                · IS spec {preview.spec[0]}–{preview.spec[1]} · {preview.within ? 'Within spec ✓' : 'OUT OF SPEC'}
+                · IS spec {preview.spec[0]}–{preview.spec[1]} · {preview.within ? 'Within band ✓' : 'OUT OF SPEC'}
               </span>
             )}
           </div>

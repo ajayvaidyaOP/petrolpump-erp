@@ -6,7 +6,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public final class FinanceApi {
     private FinanceApi() {}
@@ -276,23 +275,27 @@ public final class FinanceApi {
         Map<String, Object> station = auth.station(requiredBody(ctx, "stationId"));
         Map<String, Object> customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ?", requiredBody(ctx, "customerId"), auth.tenantId());
         if (customer == null) throw ApiException.notFound("Customer not found");
-        String rateStr = ctx.str("ratePerLitre");
-        if ((rateStr == null || rateStr.isBlank()) && ctx.str("productId") != null && !ctx.str("productId").isBlank()) {
-            Map<String, Object> price = Domain.priceAt(auth.tenantId(), ctx.str("productId"), Db.str(station, "id"));
+        String productId = blankToNull(ctx.str("productId"));
+        if (productId != null && Db.one("SELECT id FROM fuel_products WHERE id = ? AND tenant_id = ? AND is_active = 1", productId, auth.tenantId()) == null) {
+            throw ApiException.notFound("Active fuel product not found");
+        }
+        String occurredAt = resolveOccurredAtIso(ctx.str("occurredAt"));
+        String rateStr = blankToNull(ctx.str("ratePerLitre"));
+        if (rateStr == null && productId != null) {
+            Map<String, Object> price = Domain.priceAt(auth.tenantId(), productId, Db.str(station, "id"), occurredAt);
             if (price != null) rateStr = Db.str(price, "rate_per_litre");
         }
         final String resolvedRate = rateStr;
-        BigDecimal amount = ctx.str("amount") != null && !ctx.str("amount").isBlank()
-                ? Money.d(ctx.str("amount"))
-                : (ctx.str("quantityLitres") != null && resolvedRate != null ? Money.d(ctx.str("quantityLitres")).multiply(Money.d(resolvedRate)) : BigDecimal.ZERO);
-        if (amount.signum() <= 0) throw ApiException.unprocessable("Amount do, ya litres + rate do — dono me se ek zaroori hai");
+        BigDecimal amount = FinanceRules.creditAmount(ctx.str("amount"), ctx.str("quantityLitres"), resolvedRate);
+        String dueDate = blankToNull(ctx.str("dueDate"));
+        if (dueDate != null && !Clock.isIsoDate(dueDate)) throw ApiException.validation("dueDate", "dueDate must be YYYY-MM-DD");
         String id = Clock.newId("cre");
-        String occurredAt = resolveOccurredAtIso(ctx.str("occurredAt"));
         String businessDate = resolveBusinessDate(occurredAt);
         String now = Clock.nowIso();
         Map<String, Object> result = Db.tx(() -> {
             Domain.assertDayOpen(Db.str(station, "id"), businessDate);
-            Map<String, Object> freshCustomer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ?", customer.get("id"), auth.tenantId());
+            Map<String, Object> freshCustomer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ? FOR UPDATE", customer.get("id"), auth.tenantId());
+            if (freshCustomer == null || !"ACTIVE".equals(Db.str(freshCustomer, "status"))) throw ApiException.unprocessable("Customer is not active");
             BigDecimal curBalance = Money.d(freshCustomer.get("balance"));
             BigDecimal limit = Money.d(freshCustomer.get("credit_limit"));
             if (limit.signum() > 0 && curBalance.add(amount).compareTo(limit) > 0) {
@@ -316,10 +319,10 @@ public final class FinanceApi {
                     ctx.str("vehicleNumber"), ctx.str("driverName"), ctx.str("productId"),
                     ctx.str("quantityLitres") == null ? null : Money.litres(ctx.str("quantityLitres")),
                     resolvedRate == null ? null : Money.rate(resolvedRate),
-                    ctx.str("reference"), occurredAt, ctx.str("dueDate"), ctx.str("note"), auth.userId, now);
+                    ctx.str("reference"), occurredAt, dueDate, ctx.str("note"), auth.userId, now);
             String newBal = Money.money(curBalance.add(amount));
             Db.exec("UPDATE customers SET balance = ?, updated_at = ? WHERE id = ?", newBal, now, customer.get("id"));
-            Auth.audit(auth, "CREDIT_SALE_RECORDED", "CreditEntry", id, Db.str(station, "id"), customer.get("name") + ": " + Money.money(amount));
+            Auth.auditRequired(auth, "CREDIT_SALE_RECORDED", "CreditEntry", id, Db.str(station, "id"), customer.get("name") + ": " + Money.money(amount), null, Db.one("SELECT * FROM credit_entries WHERE id = ?", id));
             String visibleNewBalance = auth.allStations
                     ? newBal
                     : Domain.stationScopedCustomerBalance(auth.tenantId(), Db.str(customer, "id"), auth.stationIds);
@@ -348,11 +351,15 @@ public final class FinanceApi {
         }
 
         final List<Map<String, Object>> deliveryRows;
+        final List<Map<String, Object>> lubePurchaseRows;
         final List<Map<String, Object>> paymentRows;
         if (stationIds == null) {
             deliveryRows = Db.all(
                     "SELECT d.*, p.name AS product_name FROM deliveries d JOIN fuel_products p ON p.id = d.product_id "
                             + "WHERE d.supplier_id = ? AND d.tenant_id = ? AND d.status = 'RECEIVED'",
+                    supplier.get("id"), auth.tenantId());
+            lubePurchaseRows = Db.all(
+                    "SELECT m.*, p.name AS product_name FROM lube_movements m JOIN lube_products p ON p.id = m.product_id WHERE m.supplier_id = ? AND m.tenant_id = ? AND m.type = 'PURCHASE'",
                     supplier.get("id"), auth.tenantId());
             paymentRows = Db.all(
                     "SELECT * FROM payments WHERE supplier_id = ? AND tenant_id = ? AND direction = 'PAYOUT' AND status != 'REVERSED'",
@@ -368,6 +375,14 @@ public final class FinanceApi {
                             + "WHERE d.supplier_id = ? AND d.tenant_id = ? AND d.status = 'RECEIVED' AND d.station_id IN (" + inSql + ")",
                     dParams.toArray());
 
+            List<Object> lParams = new ArrayList<>(2 + stationIds.size());
+            lParams.add(supplier.get("id"));
+            lParams.add(auth.tenantId());
+            lParams.addAll(stationIds);
+            lubePurchaseRows = Db.all(
+                    "SELECT m.*, p.name AS product_name FROM lube_movements m JOIN lube_products p ON p.id = m.product_id "
+                            + "WHERE m.supplier_id = ? AND m.tenant_id = ? AND m.type = 'PURCHASE' AND m.station_id IN (" + inSql + ")",
+                    lParams.toArray());
             List<Object> pParams = new ArrayList<>(2 + stationIds.size());
             pParams.add(supplier.get("id"));
             pParams.add(auth.tenantId());
@@ -386,6 +401,16 @@ public final class FinanceApi {
                     "description", d.get("product_name") + " · " + d.get("quantity_litres") + " L · Inv " + d.get("invoice_number"),
                     "reference", d.get("invoice_number"),
                     "debit", Money.money(d.get("total_amount")),
+                    "credit", "0.00"));
+        }
+        for (Map<String, Object> lube : lubePurchaseRows) {
+            events.add(Web.map(
+                    "id", lube.get("id"),
+                    "date", lube.get("occurred_at"),
+                    "type", "PURCHASE",
+                    "description", lube.get("product_name") + " · " + lube.get("quantity") + " units",
+                    "reference", lube.get("reference"),
+                    "debit", Money.money(Money.d(lube.get("amount")).abs()),
                     "credit", "0.00"));
         }
         for (Map<String, Object> pay : paymentRows) {
@@ -416,7 +441,7 @@ public final class FinanceApi {
                 "entries", ledger,
                 "openingBalance", Money.money(opening),
                 "closingBalance", Money.money(running),
-                "note", "Purchases enter the payable ledger when a delivery is marked received."));
+                "note", "Fuel purchases enter the payable ledger when a delivery is marked received; lubricant purchases post when recorded. Supplier opening balance is shown only in the all-station ledger because it is not station-allocated."));
     }
 
     private static void payments(Web.Ctx ctx) {
@@ -480,23 +505,23 @@ public final class FinanceApi {
         Auth auth = ctx.requireAuth();
         auth.require("payments.write");
         String stationId = requiredBody(ctx, "stationId");
-        BigDecimal amountDec = parsePositiveMoney(requiredBody(ctx, "amount"), "amount");
+        BigDecimal amountDec = FinanceRules.positiveMoney(requiredBody(ctx, "amount"), "amount");
         String amt = Money.money(amountDec);
         String occurredAt = resolveOccurredAtIso(ctx.str("occurredAt"));
         String businessDate = resolveBusinessDate(occurredAt);
-        String partyType = (ctx.str("partyType") == null || ctx.str("partyType").isBlank()) ? "CUSTOMER" : ctx.str("partyType").trim().toUpperCase();
-        String direction = (ctx.str("direction") == null || ctx.str("direction").isBlank())
-                ? ("SUPPLIER".equals(partyType) ? "PAYOUT" : "RECEIPT")
-                : ctx.str("direction").trim().toUpperCase();
-        if (!"RECEIPT".equals(direction) && !"PAYOUT".equals(direction)) {
-            throw ApiException.validation("direction", "direction must be RECEIPT or PAYOUT");
-        }
-        String mode = (ctx.str("mode") == null || ctx.str("mode").isBlank()) ? "CASH" : ctx.str("mode").trim().toUpperCase();
-        if (!Set.of("CASH", "UPI", "CARD", "BANK", "CREDIT", "CHEQUE", "OTHER").contains(mode)) {
-            throw ApiException.validation("mode", "Unsupported payment mode: " + mode);
-        }
-        String rawCustomerId = blankToNull(ctx.str("customerId") != null ? ctx.str("customerId") : ("CUSTOMER".equals(partyType) ? ctx.str("partyId") : null));
-        String rawSupplierId = blankToNull(ctx.str("supplierId") != null ? ctx.str("supplierId") : ("SUPPLIER".equals(partyType) ? ctx.str("partyId") : null));
+        final String rawCustomerId = blankToNull(ctx.str("customerId") != null ? ctx.str("customerId") : ctx.str("partyId"));
+        final String rawSupplierId = blankToNull(ctx.str("supplierId") != null ? ctx.str("supplierId") : ctx.str("partyId"));
+        String rawPartyType = blankToNull(ctx.str("partyType"));
+        if (rawPartyType == null) rawPartyType = rawSupplierId != null ? "SUPPLIER" : "CUSTOMER";
+        String rawDirection = blankToNull(ctx.str("direction"));
+        if (rawDirection == null) rawDirection = "SUPPLIER".equals(rawPartyType) ? "PAYOUT" : "RECEIPT";
+        FinanceRules.PaymentParty party = FinanceRules.validatePayment(rawPartyType, rawDirection, rawCustomerId, rawSupplierId,
+                blankToNull(ctx.str("mode")) == null ? "CASH" : ctx.str("mode"));
+        String partyType = party.partyType();
+        String direction = party.direction();
+        final String customerIdForTx = party.customerId();
+        final String supplierIdForTx = party.supplierId();
+        String mode = ctx.str("mode") == null || ctx.str("mode").isBlank() ? "CASH" : ctx.str("mode").trim().toUpperCase(java.util.Locale.ROOT);
         String reference = blankToNull(ctx.str("reference"));
         String settlementRef = blankToNull(ctx.str("settlementRef"));
         String status = ("CASH".equals(mode) || settlementRef != null) ? "SETTLED" : "POSTED";
@@ -509,8 +534,8 @@ public final class FinanceApi {
                 throw ApiException.conflict("A payment with this reference already exists");
             }
             Map<String, Object> customer = null;
-            if (rawCustomerId != null) {
-                customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ?", rawCustomerId, auth.tenantId());
+            if (customerIdForTx != null) {
+                customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ? FOR UPDATE", customerIdForTx, auth.tenantId());
                 if (customer == null) throw ApiException.notFound("Customer not found");
             }
             if (rawSupplierId != null) {
@@ -542,7 +567,7 @@ public final class FinanceApi {
                         Clock.newId("cre"), auth.tenantId(), stationId, rawCustomerId,
                         Money.money(amountDec.negate()), id, reference, occurredAt, notes, auth.userId, createdNow);
             }
-            Auth.audit(auth, "PAYMENT_RECORDED", "Payment", id, stationId, direction + " " + mode + " ₹" + amt);
+            Auth.auditRequired(auth, "PAYMENT_RECORDED", "Payment", id, stationId, direction + " " + mode + " ₹" + amt, null, Db.one("SELECT * FROM payments WHERE id = ?", id));
             return loadShapedPayment(id);
         });
         ctx.created(created);
@@ -557,7 +582,7 @@ public final class FinanceApi {
             throw ApiException.validation("settlementRef", "Settlement reference is required");
         }
         Map<String, Object> settled = Db.tx(() -> {
-            Map<String, Object> payment = Db.one("SELECT * FROM payments WHERE id = ? AND tenant_id = ?", paymentId, auth.tenantId());
+            Map<String, Object> payment = Db.one("SELECT * FROM payments WHERE id = ? AND tenant_id = ? FOR UPDATE", paymentId, auth.tenantId());
             if (payment == null) throw ApiException.notFound("Payment not found");
             String stationId = Db.str(payment, "station_id");
             auth.station(stationId);
@@ -572,7 +597,7 @@ public final class FinanceApi {
             String now = Clock.nowIso();
             Db.exec("UPDATE payments SET status = 'SETTLED', settlement_ref = ?, settled_at = ? WHERE id = ?",
                     settlementRef, now, paymentId);
-            Auth.audit(auth, "PAYMENT_SETTLED", "Payment", paymentId, stationId, "Settled ref " + settlementRef);
+            Auth.auditRequired(auth, "PAYMENT_SETTLED", "Payment", paymentId, stationId, "Settled ref " + settlementRef, payment, Db.one("SELECT * FROM payments WHERE id = ?", paymentId));
             return loadShapedPayment(paymentId);
         });
         ctx.ok(settled);
@@ -587,7 +612,7 @@ public final class FinanceApi {
             throw ApiException.validation("reason", "Reversal reason must be at least 3 characters");
         }
         Map<String, Object> result = Db.tx(() -> {
-            Map<String, Object> payment = Db.one("SELECT * FROM payments WHERE id = ? AND tenant_id = ?", paymentId, auth.tenantId());
+            Map<String, Object> payment = Db.one("SELECT * FROM payments WHERE id = ? AND tenant_id = ? FOR UPDATE", paymentId, auth.tenantId());
             if (payment == null) throw ApiException.notFound("Payment not found");
             String stationId = Db.str(payment, "station_id");
             auth.station(stationId);
@@ -607,7 +632,7 @@ public final class FinanceApi {
 
             String customerId = blankToNull(Db.str(payment, "customer_id"));
             if ("RECEIPT".equals(Db.str(payment, "direction")) && customerId != null) {
-                Map<String, Object> customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ?", customerId, auth.tenantId());
+                Map<String, Object> customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ? FOR UPDATE", customerId, auth.tenantId());
                 if (customer != null) {
                     BigDecimal amt = Money.d(payment.get("amount")).abs();
                     String restoredBalance = Money.money(Money.d(customer.get("balance")).add(amt));
@@ -624,8 +649,8 @@ public final class FinanceApi {
                             now, "Payment reversal: " + reason, auth.userId, now);
                 }
             }
-            Auth.audit(auth, "PAYMENT_REVERSED", "Payment", paymentId, stationId,
-                    "Reversed ₹" + Money.money(payment.get("amount")) + ": " + reason);
+            Auth.auditRequired(auth, "PAYMENT_REVERSED", "Payment", paymentId, stationId,
+                    "Reversed ₹" + Money.money(payment.get("amount")) + ": " + reason, payment, Db.one("SELECT * FROM payments WHERE id = ?", paymentId));
             Map<String, Object> shaped = loadShapedPayment(paymentId);
             shaped.put("reversed", true);
             return shaped;
@@ -712,7 +737,7 @@ public final class FinanceApi {
         Map<String, Object> sum = Db.one("SELECT COALESCE(SUM(CAST(amount AS DECIMAL(20,2))), 0) AS total FROM expenses WHERE " + where, params.toArray());
         params.add(size);
         params.add((page - 1) * size);
-        ctx.ok(Map.of("expenses", Json.shapeAll(Db.all("SELECT * FROM expenses WHERE " + where + " ORDER BY occurred_at DESC LIMIT ? OFFSET ?", params.toArray())), "totalAmount", Money.money(sum.get("total"))), Domain.page(total, page, size));
+        ctx.ok(Map.of("expenses", Json.shapeAll(Db.all("SELECT e.*, u.name AS created_by_name FROM expenses e LEFT JOIN users u ON u.id = e.created_by WHERE " + where.replace("tenant_id", "e.tenant_id").replace("station_id", "e.station_id").replace("occurred_at", "e.occurred_at") + " ORDER BY e.occurred_at DESC LIMIT ? OFFSET ?", params.toArray())), "totalAmount", Money.money(sum.get("total"))), Domain.page(total, page, size));
     }
 
     private static void createExpense(Web.Ctx ctx) {
@@ -720,22 +745,25 @@ public final class FinanceApi {
         auth.require("expenses.write");
         String stationId = requiredBody(ctx, "stationId");
         String description = requiredBody(ctx, "description").trim();
-        BigDecimal amountDec = parsePositiveMoney(requiredBody(ctx, "amount"), "amount");
+        BigDecimal amountDec = FinanceRules.positiveMoney(requiredBody(ctx, "amount"), "amount");
         String occurredAt = resolveOccurredAtIso(ctx.str("occurredAt"));
         String businessDate = resolveBusinessDate(occurredAt);
-        String paidVia = (ctx.str("paidVia") == null || ctx.str("paidVia").isBlank()) ? "CASH" : ctx.str("paidVia").trim().toUpperCase();
+        String paidVia = (ctx.str("paidVia") == null || ctx.str("paidVia").isBlank()) ? "CASH" : ctx.str("paidVia").trim().toUpperCase(java.util.Locale.ROOT);
+        if (!FinanceRules.PAYMENT_MODES.contains(paidVia)) throw ApiException.validation("paidVia", "paidVia must be CASH, UPI, CARD, BANK or CHEQUE");
         String categoryId = blankToNull(ctx.str("categoryId"));
         String categoryName = blankToNull(ctx.str("categoryName"));
 
         Map<String, Object> created = Db.tx(() -> {
             Map<String, Object> station = auth.station(stationId);
             Domain.assertDayOpen(stationId, businessDate);
-            String resolvedCatName = categoryName;
-            if (resolvedCatName == null && categoryId != null) {
-                Map<String, Object> cat = Db.one("SELECT name FROM expense_categories WHERE id = ? AND tenant_id = ?", categoryId, auth.tenantId());
-                if (cat != null) resolvedCatName = Db.str(cat, "name");
+            String resolvedCatName = "General";
+            if (categoryId != null) {
+                Map<String, Object> cat = Db.one("SELECT name FROM expense_categories WHERE id = ? AND tenant_id = ? AND is_active = 1", categoryId, auth.tenantId());
+                if (cat == null) throw ApiException.notFound("Active expense category not found");
+                resolvedCatName = Db.str(cat, "name");
+            } else if (categoryName != null) {
+                resolvedCatName = categoryName;
             }
-            if (resolvedCatName == null) resolvedCatName = "General";
             String id = Clock.newId("exp");
             String now = Clock.nowIso();
             Db.exec(
@@ -747,7 +775,7 @@ public final class FinanceApi {
                     id, auth.tenantId(), station.get("id"), categoryId, resolvedCatName,
                     description, Money.money(amountDec), occurredAt,
                     paidVia, blankToNull(ctx.str("reference")), auth.userId, now);
-            Auth.audit(auth, "EXPENSE_RECORDED", "Expense", id, stationId, description + ": ₹" + Money.money(amountDec));
+            Auth.auditRequired(auth, "EXPENSE_RECORDED", "Expense", id, stationId, description + ": ₹" + Money.money(amountDec), null, Db.one("SELECT * FROM expenses WHERE id = ?", id));
             return Json.shape(Db.one("SELECT * FROM expenses WHERE id = ?", id));
         });
         ctx.created(created);
@@ -764,7 +792,7 @@ public final class FinanceApi {
             auth.station(stationId);
             Domain.assertDayOpen(stationId, resolveBusinessDate(Db.str(exp, "occurred_at")));
             Db.exec("DELETE FROM expenses WHERE id = ?", expenseId);
-            Auth.audit(auth, "EXPENSE_DELETED", "Expense", expenseId, stationId, "Deleted expense: " + exp.get("description"));
+            Auth.auditRequired(auth, "EXPENSE_DELETED", "Expense", expenseId, stationId, "Deleted expense: " + exp.get("description"), exp, null);
             return null;
         });
         ctx.ok(Map.of("deleted", true));
@@ -1014,10 +1042,10 @@ public final class FinanceApi {
         String date = Domain.requireDate(ctx.q("businessDate"), "Date");
         Map<String, Object> expected = computeExpectedReconciliation(stationId, date);
         Map<String, Object> existing = Db.one(
-                "SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC, id DESC LIMIT 1",
                 stationId, date);
         List<Map<String, Object>> historyRows = Db.all(
-                "SELECT * FROM reconciliations WHERE station_id = ? ORDER BY business_date DESC, created_at DESC LIMIT 30",
+                "SELECT * FROM reconciliations WHERE station_id = ? ORDER BY business_date DESC, created_at DESC, id DESC LIMIT 30",
                 stationId);
         List<Map<String, Object>> history = new ArrayList<>(historyRows.size());
         for (Map<String, Object> r : historyRows) {
@@ -1038,75 +1066,62 @@ public final class FinanceApi {
         auth.require("reconciliation.write");
         String stationId = requiredBody(ctx, "stationId");
         String date = Domain.requireDate(requiredBody(ctx, "businessDate"), "Business date");
-        BigDecimal cashCounted = parseNonNegativeDecimal(
+        BigDecimal cashCounted = FinanceRules.nonNegativeMoney(
                 ctx.str("cashCounted") == null || ctx.str("cashCounted").isBlank() ? "0" : ctx.str("cashCounted"),
                 "cashCounted");
-        BigDecimal digitalSettled = parseNonNegativeDecimal(
+        BigDecimal digitalSettled = FinanceRules.nonNegativeMoney(
                 ctx.str("digitalSettled") == null || ctx.str("digitalSettled").isBlank() ? "0" : ctx.str("digitalSettled"),
                 "digitalSettled");
         String notes = blankToNull(ctx.str("notes"));
 
         Map<String, Object> saved = Db.tx(() -> {
             auth.station(stationId);
+            // Serialize revisions for this station without changing the existing schema.
+            if (Db.one("SELECT id FROM stations WHERE id = ? FOR UPDATE", stationId) == null) throw ApiException.notFound("Station not found");
             Domain.assertDayOpen(stationId, date);
             Map<String, Object> expected = computeExpectedReconciliation(stationId, date);
             BigDecimal cashExpected = Money.d(expected.get("cash"));
             BigDecimal digitalExpected = Money.d(expected.get("digital"));
-            BigDecimal cashVariance = cashCounted.subtract(cashExpected);
-            BigDecimal digitalVariance = digitalSettled.subtract(digitalExpected);
-            BigDecimal netVariance = cashVariance.add(digitalVariance);
-
-            boolean cashBalanced = cashVariance.abs().compareTo(BigDecimal.ONE) <= 0;
-            boolean digitalBalanced = digitalVariance.abs().compareTo(BigDecimal.ONE) <= 0;
-            String status = (cashBalanced && digitalBalanced) ? "BALANCED" : "VARIANCE";
-            // If cash shortage and digital excess cancel out in net sum, surface cashVariance so variance is never shown as 0.00 on VARIANCE status
-            BigDecimal storedVariance = (!cashBalanced && netVariance.abs().compareTo(BigDecimal.ONE) <= 0)
-                    ? cashVariance
-                    : netVariance;
+            FinanceRules.Variances variance = FinanceRules.reconciliation(cashExpected, cashCounted, digitalExpected, digitalSettled);
+            BigDecimal cashVariance = variance.cash();
+            BigDecimal digitalVariance = variance.digital();
+            String status = variance.status();
+            BigDecimal storedVariance = variance.displayed();
 
             Map<String, Object> existing = Db.one(
-                    "SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC LIMIT 1",
+                    "SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC, id DESC LIMIT 1",
                     stationId, date);
             String now = Clock.nowIso();
-            String id;
-            if (existing != null) {
-                id = Db.str(existing, "id");
-                Db.exec("DELETE FROM reconciliations WHERE station_id = ? AND business_date = ? AND id != ?", stationId, date, id);
-                Db.exec(
-                        """
-                        UPDATE reconciliations
-                           SET cash_expected = ?,
-                               cash_counted = ?,
-                               digital_expected = ?,
-                               digital_settled = ?,
-                               variance = ?,
-                               status = ?,
-                               notes = ?,
-                               created_by = ?,
-                               approved_by = NULL,
-                               approved_at = NULL,
-                               created_at = ?
-                         WHERE id = ?
-                        """,
-                        Money.money(cashExpected), Money.money(cashCounted),
-                        Money.money(digitalExpected), Money.money(digitalSettled),
-                        Money.money(storedVariance), status, notes, auth.userId, now, id);
-            } else {
-                id = Clock.newId("rec");
-                Db.exec(
-                        """
-                        INSERT INTO reconciliations
-                          (id, tenant_id, station_id, business_date, type, cash_expected, cash_counted,
-                           digital_expected, digital_settled, variance, status, notes, created_by, created_at)
-                        VALUES (?, ?, ?, ?, 'CASH', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        id, auth.tenantId(), stationId, date,
-                        Money.money(cashExpected), Money.money(cashCounted),
-                        Money.money(digitalExpected), Money.money(digitalSettled),
-                        Money.money(storedVariance), status, notes, auth.userId, now);
+            boolean sameCounts = existing != null
+                    && Money.money(existing.get("cash_expected")).equals(Money.money(cashExpected))
+                    && Money.money(existing.get("cash_counted")).equals(Money.money(cashCounted))
+                    && Money.money(existing.get("digital_expected")).equals(Money.money(digitalExpected))
+                    && Money.money(existing.get("digital_settled")).equals(Money.money(digitalSettled))
+                    && java.util.Objects.equals(blankToNull(Db.str(existing, "notes")), notes);
+            if (sameCounts) return shapeReconciliationRow(existing);
+            String revisionReason = blankToNull(ctx.str("revisionReason"));
+            if (existing != null && "APPROVED".equals(Db.str(existing, "status"))
+                    && (revisionReason == null || revisionReason.length() < 10)) {
+                throw ApiException.validation("revisionReason", "Changing an approved reconciliation requires a revision reason of at least 10 characters");
             }
-            Auth.audit(auth, "RECONCILIATION_SAVED", "Reconciliation", id, stationId,
-                    date + " " + status + " (cashVar=" + Money.money(cashVariance) + ", digitalVar=" + Money.money(digitalVariance) + ")");
+            String id = Clock.newId("rec");
+            Db.exec(
+                    """
+                    INSERT INTO reconciliations
+                      (id, tenant_id, station_id, business_date, type, cash_expected, cash_counted,
+                       digital_expected, digital_settled, variance, status, notes, created_by, created_at)
+                    VALUES (?, ?, ?, ?, 'CASH', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    id, auth.tenantId(), stationId, date,
+                    Money.money(cashExpected), Money.money(cashCounted),
+                    Money.money(digitalExpected), Money.money(digitalSettled),
+                    Money.money(storedVariance), status,
+                    revisionReason == null ? notes : (notes == null ? "Revision: " + revisionReason : notes + " · Revision: " + revisionReason),
+                    auth.userId, now);
+            Map<String, Object> savedRow = Db.one("SELECT * FROM reconciliations WHERE id = ?", id);
+            Auth.auditRequired(auth, "RECONCILIATION_SAVED", "Reconciliation", id, stationId,
+                    date + " " + status + " (cashVar=" + Money.money(cashVariance) + ", digitalVar=" + Money.money(digitalVariance) + ")",
+                    existing, savedRow);
             return shapeReconciliationRow(Db.one("SELECT * FROM reconciliations WHERE id = ?", id));
         });
         ctx.created(saved);
@@ -1117,12 +1132,15 @@ public final class FinanceApi {
         auth.require("reconciliation.write");
         String recId = ctx.p("id");
         String note = blankToNull(ctx.str("note"));
+        if (note == null || note.length() < 3) throw ApiException.validation("note", "Approval note must be at least 3 characters");
         Map<String, Object> approved = Db.tx(() -> {
-            Map<String, Object> rec = Db.one("SELECT * FROM reconciliations WHERE id = ? AND tenant_id = ?", recId, auth.tenantId());
+            Map<String, Object> rec = Db.one("SELECT * FROM reconciliations WHERE id = ? AND tenant_id = ? FOR UPDATE", recId, auth.tenantId());
             if (rec == null) throw ApiException.notFound("Reconciliation not found");
             String stationId = Db.str(rec, "station_id");
             auth.station(stationId);
             String date = Db.str(rec, "business_date").substring(0, 10);
+            Map<String, Object> latest = Db.one("SELECT id FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC, id DESC LIMIT 1", stationId, date);
+            if (latest == null || !recId.equals(Db.str(latest, "id"))) throw ApiException.conflict("A newer reconciliation revision exists. Review and approve the latest revision.");
             Domain.assertDayOpen(stationId, date);
             String status = Db.str(rec, "status");
             if ("APPROVED".equals(status)) {
@@ -1136,7 +1154,8 @@ public final class FinanceApi {
             String now = Clock.nowIso();
             Db.exec("UPDATE reconciliations SET status = 'APPROVED', approved_by = ?, approved_at = ?, notes = ? WHERE id = ?",
                     auth.userId, now, mergedNotes, recId);
-            Auth.audit(auth, "RECONCILIATION_APPROVED", "Reconciliation", recId, stationId, date + " variance approved");
+            Auth.auditRequired(auth, "RECONCILIATION_APPROVED", "Reconciliation", recId, stationId, date + " variance approved: " + note,
+                    rec, Db.one("SELECT * FROM reconciliations WHERE id = ?", recId));
             return shapeReconciliationRow(Db.one("SELECT * FROM reconciliations WHERE id = ?", recId));
         });
         ctx.ok(approved);
@@ -1335,7 +1354,7 @@ public final class FinanceApi {
             if (receiveNow) {
                 Domain.movement(auth.tenantId(), stationId, tankId, tankProductId,
                         "DELIVERY", receivedLitresStr, "DELIVERY", id,
-                        "Tanker receipt · Inv " + invoiceNumber, auth.userId, false);
+                        "Tanker receipt · Inv " + invoiceNumber, auth.userId, false, now);
                 Auth.audit(auth, "DELIVERY_RECEIVED", "Delivery", id, stationId,
                         invoiceNumber + ": " + receivedLitresStr + " L received into " + tank.get("code"));
             } else {
@@ -1408,7 +1427,7 @@ public final class FinanceApi {
                     now, deliveryId);
             Domain.movement(auth.tenantId(), stationId, Db.str(delivery, "tank_id"), Db.str(delivery, "product_id"),
                     "DELIVERY", recvLitresStr, "DELIVERY", deliveryId,
-                    "Tanker receipt · Inv " + delivery.get("invoice_number"), auth.userId, false);
+                    "Tanker receipt · Inv " + delivery.get("invoice_number"), auth.userId, false, now);
             Auth.audit(auth, "DELIVERY_RECEIVED", "Delivery", deliveryId, stationId,
                     delivery.get("invoice_number") + ": " + recvLitresStr + " L received");
             return loadShapedDelivery(deliveryId);
@@ -1521,7 +1540,7 @@ public final class FinanceApi {
                     : Domain.requireDate(ctx.str("businessDate"), "Business date");
             Domain.assertDayOpen(stationId, businessDate);
             String movId = Domain.movement(auth.tenantId(), stationId, tankId, Db.str(tank, "product_id"),
-                    "ADJUSTMENT", Money.litres(qty), "ADJUSTMENT", null, finalReason, auth.userId, false);
+                    "ADJUSTMENT", Money.litres(qty), "ADJUSTMENT", null, finalReason, auth.userId, false, Clock.istDayStart(businessDate));
             Auth.audit(auth, "STOCK_ADJUSTED", "Tank", tankId, stationId, tank.get("code") + ": " + Money.litres(qty) + " L (" + finalReason + ")");
             return Web.map("id", movId, "bookStockLitres", Money.litres(Domain.bookStock(tankId)));
         });
@@ -1554,7 +1573,7 @@ public final class FinanceApi {
             }
             String note = ctx.str("note") == null || ctx.str("note").isBlank() ? "Opening stock" : ctx.str("note").trim();
             String movId = Domain.movement(auth.tenantId(), stationId, tankId, Db.str(tank, "product_id"),
-                    "OPENING", Money.litres(qty), "OPENING", null, note, auth.userId, false);
+                    "OPENING", Money.litres(qty), "OPENING", null, note, auth.userId, false, Clock.istDayStart(businessDate));
             Auth.audit(auth, "OPENING_STOCK_SET", "Tank", tankId, stationId, tank.get("code") + ": " + Money.litres(qty) + " L");
             String book = Money.litres(Domain.bookStock(tankId));
             return Web.map("id", movId, "bookStockLitres", book, "closingBookStock", book);
@@ -1596,9 +1615,9 @@ public final class FinanceApi {
             }
             String litres = Money.litres(qty);
             Domain.movement(auth.tenantId(), Db.str(from, "station_id"), fromId, Db.str(from, "product_id"),
-                    "TRANSFER_OUT", litres, "TRANSFER", toId, finalReason, auth.userId, false);
+                    "TRANSFER_OUT", litres, "TRANSFER", toId, finalReason, auth.userId, false, Clock.istDayStart(businessDate));
             Domain.movement(auth.tenantId(), Db.str(to, "station_id"), toId, Db.str(to, "product_id"),
-                    "TRANSFER_IN", litres, "TRANSFER", fromId, finalReason, auth.userId, false);
+                    "TRANSFER_IN", litres, "TRANSFER", fromId, finalReason, auth.userId, false, Clock.istDayStart(businessDate));
             Auth.audit(auth, "STOCK_TRANSFERRED", "Tank", fromId, Db.str(from, "station_id"),
                     from.get("code") + " -> " + to.get("code") + ": " + litres + " L (" + finalReason + ")");
             return Web.map("transferred", litres);

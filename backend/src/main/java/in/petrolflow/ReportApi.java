@@ -102,24 +102,36 @@ public final class ReportApi {
         data.put("flaggedShifts", flagged);
         data.put("stock", Domain.tankSummary(Db.str(station, "id")));
         data.put("productSplit", productSplit(Db.str(station, "id"), date, auth.tenantId()));
-        data.put("devices", Map.of("total", Db.count("SELECT COUNT(*) AS count FROM hardware_devices WHERE station_id = ? AND status != 'DISABLED'", station.get("id")), "online", 0));
-        BigDecimal stationReceivables;
-        if (auth.allStations) {
-            stationReceivables = Money.d(Db.one("SELECT COALESCE(SUM(CAST(balance AS DECIMAL(20,2))), 0) AS total FROM customers WHERE tenant_id = ?", auth.tenantId()).get("total"));
-        } else {
-            stationReceivables = BigDecimal.ZERO;
-            for (Map<String, Object> ce : Db.all(
-                    "SELECT type, amount FROM credit_entries WHERE tenant_id = ? AND station_id = ? AND status = 'POSTED'",
-                    auth.tenantId(), station.get("id"))) {
-                String t = Db.str(ce, "type");
-                BigDecimal a = Money.d(ce.get("amount"));
-                if ("CREDIT_SALE".equals(t) || "PAYMENT_REVERSAL".equals(t)) stationReceivables = stationReceivables.add(a.abs());
-                else if ("PAYMENT".equals(t)) stationReceivables = stationReceivables.subtract(a.abs());
-                else stationReceivables = stationReceivables.add(a);
+        long deviceTotal = Db.count("SELECT COUNT(*) AS count FROM hardware_devices WHERE station_id = ? AND status != 'DISABLED'", station.get("id"));
+        long deviceOnline = 0;
+        double heartbeatTimeoutMinutes = Domain.settingNumber("hardware.heartbeatTimeoutMinutes", auth.tenantId(), Db.str(station, "id"), 5);
+        long cutoffMillis = System.currentTimeMillis() - (long) (heartbeatTimeoutMinutes * 60_000L);
+        for (Map<String, Object> device : Db.all("SELECT status, last_heartbeat_at FROM hardware_devices WHERE station_id = ? AND status != 'DISABLED'", station.get("id"))) {
+            String hb = Db.str(device, "last_heartbeat_at");
+            if ("ONLINE".equals(Db.str(device, "status")) && hb != null && !hb.isBlank()) {
+                try {
+                    if (Instant.parse(hb).toEpochMilli() >= cutoffMillis) deviceOnline++;
+                } catch (RuntimeException ignored) { /* malformed heartbeat is offline */ }
             }
         }
+        data.put("devices", Map.of("total", deviceTotal, "online", deviceOnline));
+        BigDecimal stationReceivables = BigDecimal.ZERO;
+        for (BigDecimal balance : Domain.stationScopedCustomerBalances(auth.tenantId(),
+                Db.all("SELECT id FROM customers WHERE tenant_id = ?", auth.tenantId()).stream().map(c -> Db.str(c, "id")).toList(),
+                List.of(Db.str(station, "id"))).values()) {
+            stationReceivables = stationReceivables.add(balance);
+        }
+        BigDecimal stationPayables = Money.d(Db.one(
+                "SELECT COALESCE(SUM(CAST(total_amount AS DECIMAL(20,2))), 0) AS total FROM deliveries WHERE station_id = ? AND status = 'RECEIVED'",
+                station.get("id")).get("total"));
+        stationPayables = stationPayables.add(Money.d(Db.one(
+                "SELECT COALESCE(SUM(ABS(CAST(amount AS DECIMAL(20,2)))), 0) AS total FROM lube_movements WHERE station_id = ? AND type = 'PURCHASE' AND supplier_id IS NOT NULL",
+                station.get("id")).get("total")));
+        stationPayables = stationPayables.subtract(Money.d(Db.one(
+                "SELECT COALESCE(SUM(CAST(amount AS DECIMAL(20,2))), 0) AS total FROM payments WHERE station_id = ? AND direction = 'PAYOUT' AND status != 'REVERSED'",
+                station.get("id")).get("total")));
         data.put("receivables", Money.money(stationReceivables));
-        data.put("payables", "0.00");
+        data.put("payables", Money.money(stationPayables.max(BigDecimal.ZERO)));
         data.put("trend", trend);
         data.put("alerts", alerts);
         data.put("recentActivity", Json.shapeAll(Db.all(
@@ -252,7 +264,7 @@ public final class ReportApi {
         for (Map<String, Object> r : receipts) recSum = recSum.add(Money.d(r.get("amount")));
         BigDecimal purSum = BigDecimal.ZERO;
         for (Map<String, Object> d : deliveries) if ("RECEIVED".equals(d.get("status"))) purSum = purSum.add(Money.d(d.get("totalAmount")));
-        Map<String, Object> recon = Db.one("SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ?", station.get("id"), date);
+        Map<String, Object> recon = Db.one("SELECT * FROM reconciliations WHERE station_id = ? AND business_date = ? ORDER BY created_at DESC, id DESC LIMIT 1", station.get("id"), date);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("station", Web.map("name", station.get("name"), "code", station.get("code"), "address", station.get("address") == null ? "" : station.get("address"), "city", station.get("city") == null ? "" : station.get("city"), "state", station.get("state") == null ? "" : station.get("state")));
         data.put("date", date);
@@ -284,6 +296,9 @@ public final class ReportApi {
         auth.require("reports.read");
         Map<String, Object> station = auth.station(required(ctx, "stationId"));
         String month = ctx.q("month") == null ? Clock.todayIst().substring(0, 7) : ctx.q("month");
+        if (!month.matches("\\d{4}-\\d{2}") || Integer.parseInt(month.substring(5, 7)) < 1 || Integer.parseInt(month.substring(5, 7)) > 12) {
+            throw ApiException.validation("month", "month must be YYYY-MM");
+        }
         String monthStartIso = Clock.istDayStart(month + "-01");
         String nextMonthIso = Clock.istDayStart(Clock.addDays(month + "-28", 4).substring(0, 8) + "01");
         List<Map<String, Object>> products = Db.all(
@@ -587,7 +602,9 @@ public final class ReportApi {
         auth.require("reports.read");
         String stationId = ctx.q("stationId");
         String month = (ctx.q("month") == null || ctx.q("month").isBlank()) ? Clock.todayIst().substring(0, 7) : ctx.q("month").trim();
-        if (!month.matches("\\d{4}-\\d{2}")) throw ApiException.unprocessable("month (YYYY-MM) is required");
+        if (!month.matches("\\d{4}-\\d{2}") || Integer.parseInt(month.substring(5, 7)) < 1 || Integer.parseInt(month.substring(5, 7)) > 12) {
+            throw ApiException.unprocessable("month (YYYY-MM) is required");
+        }
         String fromIso = Clock.istDayStart(month + "-01");
         String toIso = Clock.istDayStart(Clock.addDays(month + "-28", 4).substring(0, 8) + "01");
 

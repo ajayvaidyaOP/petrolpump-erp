@@ -149,18 +149,43 @@ public final class OpsApi {
         if (stationId != null) auth.station(stationId);
         Map<String, Object> values = Json.object(ctx.body().get("values") == null ? ctx.body().get("settings") : ctx.body().get("values"));
         if (values.isEmpty()) values = ctx.body();
+        Map<String, String> validated = new LinkedHashMap<>();
         for (var entry : values.entrySet()) {
-            if (!defaults().containsKey(entry.getKey()) || "stationId".equals(entry.getKey())) continue;
-            String value = String.valueOf(entry.getValue());
-            String scopeStation = "station".equals(schema().get(entry.getKey()).get("scope")) ? (stationId == null ? "" : stationId) : "";
-            Map<String, Object> existing = Db.one("SELECT id FROM app_settings WHERE tenant_id = ? AND station_id = ? AND `key` = ?", auth.tenantId(), scopeStation, entry.getKey());
-            if (existing == null) {
-                Db.exec("INSERT INTO app_settings (id, tenant_id, station_id, `key`, value, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        Clock.newId("stg"), auth.tenantId(), scopeStation, entry.getKey(), value, auth.userId, Clock.nowIso());
-            } else {
-                Db.exec("UPDATE app_settings SET value = ?, updated_by = ?, updated_at = ? WHERE id = ?", value, auth.userId, Clock.nowIso(), existing.get("id"));
+            String key = entry.getKey();
+            if ("stationId".equals(key)) continue;
+            if (!defaults().containsKey(key)) throw ApiException.validation(key, "Unknown setting: " + key);
+            String value = entry.getValue() == null ? "" : String.valueOf(entry.getValue()).trim();
+            String type = String.valueOf(schema().get(key).get("type"));
+            if ("boolean".equals(type)) {
+                if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) throw ApiException.validation(key, key + " must be true or false");
+                value = value.toLowerCase(java.util.Locale.ROOT);
+            } else if ("number".equals(type)) {
+                double number;
+                try { number = Double.parseDouble(value); } catch (NumberFormatException ex) { throw ApiException.validation(key, key + " must be a number"); }
+                if (!Double.isFinite(number) || number < 0) throw ApiException.validation(key, key + " must be a non-negative finite number");
+                if (key.equals("hardware.heartbeatTimeoutMinutes") && (number < 1 || number > 1440)) throw ApiException.validation(key, "Heartbeat timeout must be between 1 and 1440 minutes");
+                if (key.equals("shifts.unclosedAlertHours") && (number < 1 || number > 168)) throw ApiException.validation(key, "Unclosed shift alert must be between 1 and 168 hours");
+            } else if (key.equals("notifications.contactEmail") && !value.isEmpty()
+                    && (!value.contains("@") || value.indexOf('@') != value.lastIndexOf('@') || value.startsWith("@") || value.endsWith("@") || value.matches(".*\\s.*"))) {
+                throw ApiException.validation(key, "Enter a valid contact email address");
             }
+            validated.put(key, value);
         }
+        if (validated.isEmpty()) throw ApiException.validation("values", "No settings were provided");
+        Db.tx(() -> {
+            for (var entry : validated.entrySet()) {
+                String scopeStation = "station".equals(schema().get(entry.getKey()).get("scope")) ? (stationId == null ? "" : stationId) : "";
+                Map<String, Object> existing = Db.one("SELECT id FROM app_settings WHERE tenant_id = ? AND station_id = ? AND `key` = ? FOR UPDATE", auth.tenantId(), scopeStation, entry.getKey());
+                if (existing == null) {
+                    Db.exec("INSERT INTO app_settings (id, tenant_id, station_id, `key`, value, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            Clock.newId("stg"), auth.tenantId(), scopeStation, entry.getKey(), entry.getValue(), auth.userId, Clock.nowIso());
+                } else {
+                    Db.exec("UPDATE app_settings SET value = ?, updated_by = ?, updated_at = ? WHERE id = ?", entry.getValue(), auth.userId, Clock.nowIso(), existing.get("id"));
+                }
+            }
+            Auth.auditRequired(auth, "SETTINGS_SAVED", "AppSettings", stationId == null ? auth.tenantId() : stationId, stationId, "Saved " + validated.size() + " setting(s)", null, new LinkedHashMap<>(validated));
+            return null;
+        });
         settings(ctx);
     }
 
@@ -256,7 +281,9 @@ public final class OpsApi {
         Map<String, Object> station = auth.station(required(ctx));
         String stationId = Db.str(station, "id");
         String month = (ctx.q("month") == null || ctx.q("month").isBlank()) ? Clock.todayIst().substring(0, 7) : ctx.q("month").trim();
-        if (!month.matches("\\d{4}-\\d{2}")) throw ApiException.unprocessable("month (YYYY-MM) is required");
+        if (!month.matches("\\d{4}-\\d{2}") || Integer.parseInt(month.substring(5, 7)) < 1 || Integer.parseInt(month.substring(5, 7)) > 12) {
+            throw ApiException.unprocessable("month (YYYY-MM) is required");
+        }
         List<Map<String, Object>> employees = new ArrayList<>();
         for (Map<String, Object> user : stationCrew(auth.tenantId(), stationId)) {
             String uid = Db.str(user, "id");
@@ -294,12 +321,22 @@ public final class OpsApi {
         Db.tx(() -> {
             Map<String, Object> station = auth.station(stationId);
             Domain.assertDayOpen(stationId, date);
+            Set<String> seenUsers = new java.util.HashSet<>();
             for (Object item : list) {
                 Map<String, Object> entry = Json.object(item);
                 String userId = entry.get("userId") == null ? "" : String.valueOf(entry.get("userId")).trim();
                 String rawStatus = entry.get("status") == null ? "" : String.valueOf(entry.get("status")).trim().toUpperCase();
                 if (userId.isEmpty() || !validStatuses.contains(rawStatus)) {
                     throw ApiException.validation("status", "Attendance status must be PRESENT, ABSENT, HALF_DAY, LEAVE, or WEEK_OFF");
+                }
+                if (!seenUsers.add(userId)) throw ApiException.validation("entries", "Duplicate attendance entry for user " + userId);
+                String inTime = entry.get("inTime") == null || String.valueOf(entry.get("inTime")).isBlank() ? null : String.valueOf(entry.get("inTime")).trim();
+                String outTime = entry.get("outTime") == null || String.valueOf(entry.get("outTime")).isBlank() ? null : String.valueOf(entry.get("outTime")).trim();
+                if (inTime != null && !inTime.matches("([01]\\d|2[0-3]):[0-5]\\d")) throw ApiException.validation("inTime", "inTime must be HH:mm");
+                if (outTime != null && !outTime.matches("([01]\\d|2[0-3]):[0-5]\\d")) throw ApiException.validation("outTime", "outTime must be HH:mm");
+                if (inTime != null && outTime != null && outTime.compareTo(inTime) < 0) throw ApiException.validation("outTime", "outTime must be on or after inTime");
+                if (("PRESENT".equals(rawStatus) || "HALF_DAY".equals(rawStatus)) && inTime == null) {
+                    throw ApiException.validation("inTime", "inTime is required for PRESENT/HALF_DAY attendance");
                 }
                 Map<String, Object> emp = Db.one(
                         "SELECT id, role_key FROM users WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'",
@@ -314,8 +351,11 @@ public final class OpsApi {
                 }
                 String now = Clock.nowIso();
                 Map<String, Object> existing = Db.one(
-                        "SELECT id FROM attendance_records WHERE user_id = ? AND attendance_date = ?",
-                        userId, date);
+                        "SELECT id, station_id FROM attendance_records WHERE user_id = ? AND tenant_id = ? AND attendance_date = ? FOR UPDATE",
+                        userId, auth.tenantId(), date);
+                if (existing != null && !stationId.equals(Db.str(existing, "station_id"))) {
+                    throw ApiException.conflict("Attendance for this user/date is already recorded at another station");
+                }
                 if (existing == null) {
                     Db.exec(
                             """
@@ -324,7 +364,7 @@ public final class OpsApi {
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             Clock.newId("att"), auth.tenantId(), station.get("id"), userId, date, rawStatus,
-                            entry.get("inTime"), entry.get("outTime"), auth.userId, now, now);
+                            inTime, outTime, auth.userId, now, now);
                 } else {
                     Db.exec(
                             """
@@ -332,7 +372,7 @@ public final class OpsApi {
                                SET station_id = ?, status = ?, in_time = ?, out_time = ?, marked_by = ?, updated_at = ?
                              WHERE id = ?
                             """,
-                            station.get("id"), rawStatus, entry.get("inTime"), entry.get("outTime"), auth.userId, now, existing.get("id"));
+                            station.get("id"), rawStatus, inTime, outTime, auth.userId, now, existing.get("id"));
                 }
             }
             Auth.audit(auth, "ATTENDANCE_MARKED", "Attendance", stationId + ":" + date, stationId,
@@ -438,7 +478,7 @@ public final class OpsApi {
                     source, auth.userId, emptyToNull(ctx.str("note")), now);
             Auth.audit(auth, "DENSITY_CHECK_RECORDED", "DensityCheck", id, stationId,
                     tank.get("code") + ": obs=" + eval.observedDensity() + " kg/m³ @ " + eval.observedTempC()
-                            + "°C -> @15°C=" + eval.densityAt15c() + " kg/m³ (" + (eval.withinSpec() == 1 ? "IN_SPEC" : "OUT_OF_SPEC")
+                            + "°C -> @15°C=" + eval.densityAt15c() + " kg/m³ (" + (eval.withinSpec() == 1 ? "WITHIN_BAND" : "OUTSIDE_BAND")
                             + " · " + eval.specificationUsed() + ")");
             Map<String, Object> row = Db.one(
                     """
@@ -468,8 +508,8 @@ public final class OpsApi {
             auth.station(stationId);
             Domain.assertDayOpen(stationId, Db.str(existing, "business_date").substring(0, 10));
             Db.exec("DELETE FROM density_checks WHERE id = ?", id);
-            Auth.audit(auth, "DENSITY_CHECK_DELETED", "DensityCheck", id, stationId,
-                    "Deleted density check for " + existing.get("business_date"));
+            Auth.auditRequired(auth, "DENSITY_CHECK_DELETED", "DensityCheck", id, stationId,
+                    "Deleted density check for " + existing.get("business_date"), existing, null);
             return null;
         });
         ctx.ok(Map.of("deleted", true));
@@ -509,6 +549,18 @@ public final class OpsApi {
         Auth auth = ctx.requireAuth();
         auth.require("compliance.write");
         Map<String, Object> station = auth.station(requiredBody(ctx, "stationId"));
+        String expiresOn = Domain.requireDate(requiredBody(ctx, "expiresOn"), "expiresOn");
+        String issuedOn = emptyToNull(ctx.str("issuedOn"));
+        if (issuedOn != null) {
+            issuedOn = Domain.requireDate(issuedOn, "issuedOn");
+            if (issuedOn.compareTo(expiresOn) > 0) throw ApiException.validation("issuedOn", "issuedOn must be on or before expiresOn");
+        }
+        int lead = ctx.str("renewalLeadDays") == null ? 30 : Integer.parseInt(ctx.str("renewalLeadDays"));
+        if (lead < 0 || lead > 365) throw ApiException.validation("renewalLeadDays", "renewalLeadDays must be between 0 and 365");
+        String dispenserId = emptyToNull(ctx.str("dispenserId"));
+        String tankId = emptyToNull(ctx.str("tankId"));
+        if (dispenserId != null && Db.one("SELECT id FROM dispensers WHERE id = ? AND station_id = ?", dispenserId, station.get("id")) == null) throw ApiException.validation("dispenserId", "Dispenser does not belong to this station");
+        if (tankId != null && Db.one("SELECT id FROM tanks WHERE id = ? AND station_id = ?", tankId, station.get("id")) == null) throw ApiException.validation("tankId", "Tank does not belong to this station");
         String id = Clock.newId("cmp");
         String now = Clock.nowIso();
         Db.exec(
@@ -517,25 +569,41 @@ public final class OpsApi {
                   (id, tenant_id, station_id, dispenser_id, tank_id, doc_type, title, doc_number, authority, issued_on, expires_on, renewal_lead_days, notes, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                id, auth.tenantId(), station.get("id"), emptyToNull(ctx.str("dispenserId")), emptyToNull(ctx.str("tankId")),
+                id, auth.tenantId(), station.get("id"), dispenserId, tankId,
                 requiredBody(ctx, "docType"), requiredBody(ctx, "title"), ctx.str("docNumber"), ctx.str("authority"),
-                emptyToNull(ctx.str("issuedOn")), requiredBody(ctx, "expiresOn"),
-                ctx.str("renewalLeadDays") == null ? 30 : Integer.parseInt(ctx.str("renewalLeadDays")), ctx.str("notes"), now, now);
+                issuedOn, expiresOn, lead, ctx.str("notes"), now, now);
         ctx.created(Json.shape(Db.one("SELECT * FROM compliance_documents WHERE id = ?", id)));
     }
 
     private static void patchCompliance(Web.Ctx ctx) {
         Auth auth = ctx.requireAuth();
         auth.require("compliance.write");
-        Db.exec("UPDATE compliance_documents SET title = COALESCE(?, title), expires_on = COALESCE(?, expires_on), notes = COALESCE(?, notes), updated_at = ? WHERE id = ? AND tenant_id = ?",
-                ctx.str("title"), ctx.str("expiresOn"), ctx.str("notes"), Clock.nowIso(), ctx.p("id"), auth.tenantId());
-        ctx.ok(Json.shape(Db.one("SELECT * FROM compliance_documents WHERE id = ?", ctx.p("id"))));
+        Map<String, Object> existing = Db.one("SELECT * FROM compliance_documents WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Compliance document not found");
+        auth.station(Db.str(existing, "station_id"));
+        String expiresOn = ctx.str("expiresOn") == null || ctx.str("expiresOn").isBlank() ? Db.str(existing, "expires_on").substring(0, 10) : Domain.requireDate(ctx.str("expiresOn"), "expiresOn");
+        String issuedOn = ctx.body().containsKey("issuedOn") ? emptyToNull(ctx.str("issuedOn")) : (Db.str(existing, "issued_on") == null ? null : Db.str(existing, "issued_on").substring(0, 10));
+        if (issuedOn != null) {
+            issuedOn = Domain.requireDate(issuedOn, "issuedOn");
+            if (issuedOn.compareTo(expiresOn) > 0) throw ApiException.validation("issuedOn", "issuedOn must be on or before expiresOn");
+        }
+        int lead = ctx.str("renewalLeadDays") == null || ctx.str("renewalLeadDays").isBlank() ? (int) Db.num(existing, "renewal_lead_days") : Integer.parseInt(ctx.str("renewalLeadDays"));
+        if (lead < 0 || lead > 365) throw ApiException.validation("renewalLeadDays", "renewalLeadDays must be between 0 and 365");
+        Db.exec("UPDATE compliance_documents SET title = COALESCE(?, title), issued_on = ?, expires_on = ?, renewal_lead_days = ?, notes = COALESCE(?, notes), updated_at = ? WHERE id = ? AND tenant_id = ?",
+                ctx.str("title"), issuedOn, expiresOn, lead, ctx.str("notes"), Clock.nowIso(), ctx.p("id"), auth.tenantId());
+        Map<String, Object> after = Db.one("SELECT * FROM compliance_documents WHERE id = ?", ctx.p("id"));
+        Auth.auditRequired(auth, "COMPLIANCE_UPDATED", "ComplianceDocument", ctx.p("id"), Db.str(existing, "station_id"), "Updated compliance document", existing, after);
+        ctx.ok(Json.shape(after));
     }
 
     private static void deleteCompliance(Web.Ctx ctx) {
         Auth auth = ctx.requireAuth();
         auth.require("compliance.write");
+        Map<String, Object> existing = Db.one("SELECT * FROM compliance_documents WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Compliance document not found");
+        auth.station(Db.str(existing, "station_id"));
         Db.exec("DELETE FROM compliance_documents WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        Auth.auditRequired(auth, "COMPLIANCE_DELETED", "ComplianceDocument", ctx.p("id"), Db.str(existing, "station_id"), "Deleted compliance document", existing, null);
         ctx.ok(Map.of("deleted", true));
     }
 
@@ -677,7 +745,7 @@ public final class OpsApi {
 
         Map<String, Object> created = Db.tx(() -> {
             Map<String, Object> station = auth.station(stationId);
-            Map<String, Object> product = Db.one("SELECT * FROM lube_products WHERE id = ? AND tenant_id = ?", productId, auth.tenantId());
+            Map<String, Object> product = Db.one("SELECT * FROM lube_products WHERE id = ? AND tenant_id = ? FOR UPDATE", productId, auth.tenantId());
             if (product == null) throw ApiException.notFound("Lubricant SKU not found");
             if ("SALE".equals(type) && Db.num(product, "is_active") == 0) {
                 throw ApiException.unprocessable("Inactive lubricant SKU cannot be sold");
@@ -705,8 +773,20 @@ public final class OpsApi {
                     : ("ADJUSTMENT".equals(type) ? BigDecimal.ZERO : absQty.multiply(rate));
 
             String paymentMode = "SALE".equals(type)
-                    ? ((ctx.str("paymentMode") == null || ctx.str("paymentMode").isBlank()) ? "CASH" : ctx.str("paymentMode").trim().toUpperCase())
+                    ? ((ctx.str("paymentMode") == null || ctx.str("paymentMode").isBlank()) ? "CASH" : ctx.str("paymentMode").trim().toUpperCase(java.util.Locale.ROOT))
                     : emptyToNull(ctx.str("paymentMode"));
+            if ("SALE".equals(type) && !Set.of("CASH", "UPI", "CARD", "BANK", "CREDIT").contains(paymentMode)) {
+                throw ApiException.validation("paymentMode", "Lubricant sale paymentMode must be CASH, UPI, CARD, BANK or CREDIT");
+            }
+            if (paymentMode != null && !"SALE".equals(type) && !Set.of("CASH", "UPI", "CARD", "BANK", "CHEQUE", "CREDIT").contains(paymentMode)) {
+                throw ApiException.validation("paymentMode", "Unsupported paymentMode: " + paymentMode);
+            }
+            if (("SALE".equals(type) || "PURCHASE".equals(type)) && ctx.str("amount") != null && !ctx.str("amount").isBlank()) {
+                BigDecimal expectedAmount = absQty.multiply(rate).setScale(2, RoundingMode.HALF_UP);
+                if (amount.compareTo(expectedAmount) != 0) {
+                    throw ApiException.validation("amount", "amount must equal quantity × rate (" + Money.money(expectedAmount) + ")");
+                }
+            }
             String customerId = emptyToNull(ctx.str("customerId"));
             String supplierId = emptyToNull(ctx.str("supplierId"));
             if ("SALE".equals(type) && "CREDIT".equals(paymentMode)) {
@@ -716,7 +796,7 @@ public final class OpsApi {
             }
             Map<String, Object> customer = null;
             if (customerId != null) {
-                customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ?", customerId, auth.tenantId());
+                customer = Db.one("SELECT * FROM customers WHERE id = ? AND tenant_id = ? FOR UPDATE", customerId, auth.tenantId());
                 if (customer == null) throw ApiException.notFound("Customer not found");
             }
             if (supplierId != null) {

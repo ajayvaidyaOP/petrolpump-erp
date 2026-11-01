@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BookOpen, IndianRupee, Phone, Plus, Printer, Trash2, Truck, UserPlus, Users } from 'lucide-react';
-import { apiDelete, apiGet, apiList, apiPatch, apiPost, idempotencyKey, type ListMeta } from '../lib/api';
+import { apiDelete, apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, formatNumber, todayIst } from '../lib/format';
 import {
@@ -124,6 +125,9 @@ export default function Customers() {
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['customers'] });
     void queryClient.invalidateQueries({ queryKey: ['customer-ledger'] });
+    void queryClient.invalidateQueries({ queryKey: ['payments'] });
+    void queryClient.invalidateQueries({ queryKey: ['finance-summary'] });
+    void queryClient.invalidateQueries({ queryKey: ['reconciliation'] });
     void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
   };
 
@@ -716,26 +720,18 @@ function CreditSaleModal({
     return d.toISOString().slice(0, 10);
   });
 
+  const payload = {
+    stationId, customerId: customer.id, productId: productId || undefined,
+    quantityLitres: quantity || undefined, amount: quantity ? undefined : amount,
+    slipNumber: slipNumber || undefined, vehicleNumber: vehicleNumber || undefined,
+    driverName: driverName || undefined, reference: reference || undefined,
+    dueDate, paymentMode: 'CREDIT',
+  };
+  const idempotency = useIdempotencyKey('credit-sale', payload);
   const mutation = useMutation({
-    mutationFn: () =>
-      apiPost(
-        '/finance/credit-sales',
-        {
-          stationId,
-          customerId: customer.id,
-          productId: productId || undefined,
-          quantityLitres: quantity || undefined,
-          amount: quantity ? undefined : amount,
-          slipNumber: slipNumber || undefined,
-          vehicleNumber: vehicleNumber || undefined,
-          driverName: driverName || undefined,
-          reference: reference || undefined,
-          dueDate,
-          paymentMode: 'CREDIT',
-        },
-        idempotencyKey('credit-sale'),
-      ),
+    mutationFn: () => apiPost('/finance/credit-sales', payload, idempotency.key),
     onSuccess: () => {
+      idempotency.reset();
       toast('Credit sale recorded', { description: 'Customer balance updated with a ledger entry.' });
       onDone();
     },
@@ -816,22 +812,15 @@ function ReceiptModal({
   const [mode, setMode] = useState('CASH');
   const [reference, setReference] = useState('');
 
+  const payload = {
+    stationId, direction: 'RECEIPT', partyType: 'CUSTOMER', customerId: customer.id,
+    amount, mode, reference: reference || undefined,
+  };
+  const idempotency = useIdempotencyKey('receipt', payload);
   const mutation = useMutation({
-    mutationFn: () =>
-      apiPost(
-        '/finance/payments',
-        {
-          stationId,
-          direction: 'RECEIPT',
-          partyType: 'CUSTOMER',
-          customerId: customer.id,
-          amount,
-          mode,
-          reference: reference || undefined,
-        },
-        idempotencyKey('receipt'),
-      ),
+    mutationFn: () => apiPost('/finance/payments', payload, idempotency.key),
     onSuccess: () => {
+      idempotency.reset();
       toast('Receipt recorded', { description: 'Balance reduced and payment stored separately from sales.' });
       onDone();
     },

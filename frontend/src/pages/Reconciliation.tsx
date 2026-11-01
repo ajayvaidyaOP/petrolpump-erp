@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BadgeCheck, Banknote, Calculator, CreditCard } from 'lucide-react';
 import { apiGet, apiPost } from '../lib/api';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, todayIst } from '../lib/format';
+import { useIdempotencyKey } from '../lib/idempotency';
 import {
   Button,
   Card,
@@ -13,6 +14,7 @@ import {
   Field,
   Input,
   LoadingBlock,
+  Modal,
   PageHeader,
   StatCard,
   StatusBadge,
@@ -38,6 +40,7 @@ interface ReconFigures {
   };
   note: string;
   history: ReconRow[];
+  row: ReconRow | null;
 }
 
 interface ReconRow {
@@ -48,6 +51,8 @@ interface ReconRow {
   digitalExpected: string;
   digitalSettled: string;
   variance: string;
+  cashVariance: string;
+  digitalVariance: string;
   status: string;
   notes: string | null;
   approvedAt: string | null;
@@ -64,6 +69,9 @@ export default function Reconciliation() {
   const [cashCounted, setCashCounted] = useState('');
   const [digitalSettled, setDigitalSettled] = useState('');
   const [notes, setNotes] = useState('');
+  const [revisionReason, setRevisionReason] = useState('');
+  const [approveRow, setApproveRow] = useState<ReconRow | null>(null);
+  const [approvalNote, setApprovalNote] = useState('');
 
   const figures = useQuery({
     queryKey: ['reconciliation', stationId, date],
@@ -71,15 +79,27 @@ export default function Reconciliation() {
     enabled: Boolean(stationId),
   });
 
+  const existing = figures.data?.row ?? null;
+
+  useEffect(() => {
+    setCashCounted(existing?.cashCounted ?? '');
+    setDigitalSettled(existing?.digitalSettled ?? '');
+    setNotes(existing?.notes ?? '');
+    setRevisionReason('');
+  }, [stationId, date, existing?.id]);
+
+  const payload = {
+    stationId,
+    businessDate: date,
+    cashCounted: cashCounted || '0',
+    digitalSettled: digitalSettled || '0',
+    notes: notes || undefined,
+    revisionReason: existing?.status === 'APPROVED' ? revisionReason : undefined,
+  };
+  const idempotency = useIdempotencyKey('reconciliation', payload);
+
   const submit = useMutation({
-    mutationFn: () =>
-      apiPost<ReconRow>('/finance/reconciliation', {
-        stationId,
-        businessDate: date,
-        cashCounted: cashCounted || '0',
-        digitalSettled: digitalSettled || '0',
-        notes: notes || undefined,
-      }),
+    mutationFn: () => apiPost<ReconRow>('/finance/reconciliation', payload, idempotency.key),
     onSuccess: (row: ReconRow) => {
       toast('Reconciliation saved', {
         tone: row.status === 'BALANCED' ? 'success' : 'warning',
@@ -88,19 +108,22 @@ export default function Reconciliation() {
             ? 'Cash and digital collections match the expected figures.'
             : `Variance of ${formatINR(row.variance)} recorded for approval.`,
       });
-      setCashCounted('');
-      setDigitalSettled('');
-      setNotes('');
+      idempotency.reset();
+      setRevisionReason('');
       void queryClient.invalidateQueries({ queryKey: ['reconciliation'] });
+      void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
     },
     onError: (e) => toast('Could not save reconciliation', { tone: 'danger', description: (e as Error).message }),
   });
 
   const approve = useMutation({
-    mutationFn: (id: string) => apiPost(`/finance/reconciliation/${id}/approve`, { note: 'Variance reviewed' }),
+    mutationFn: ({ id, note }: { id: string; note: string }) => apiPost(`/finance/reconciliation/${id}/approve`, { note }),
     onSuccess: () => {
       toast('Reconciliation approved');
+      setApproveRow(null);
+      setApprovalNote('');
       void queryClient.invalidateQueries({ queryKey: ['reconciliation'] });
+      void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
     },
     onError: (e) => toast('Approval failed', { tone: 'danger', description: (e as Error).message }),
   });
@@ -108,9 +131,13 @@ export default function Reconciliation() {
   if (!stationId) return <EmptyState title="No station assigned" />;
 
   const expected = figures.data?.expected;
-  const countedValue = Number(cashCounted || 0);
-  const expectedCash = Number(expected?.cash ?? 0);
-  const variance = countedValue - expectedCash;
+  const cashVariance = Number(cashCounted || 0) - Number(expected?.cash ?? 0);
+  const digitalVariance = Number(digitalSettled || 0) - Number(expected?.digital ?? 0);
+  const needsApproval = Math.abs(cashVariance) > 1 || Math.abs(digitalVariance) > 1;
+  const latestIds = new Set<string>();
+  for (const row of figures.data?.history ?? []) {
+    if (!latestIds.has(row.businessDate)) latestIds.add(row.id);
+  }
 
   return (
     <>
@@ -149,16 +176,27 @@ export default function Reconciliation() {
                     <Input inputMode="decimal" value={digitalSettled} onChange={(e) => setDigitalSettled(e.target.value)} placeholder="0.00" />
                   </Field>
                 </div>
-                <div className={Math.abs(variance) <= 1 ? 'callout-ok' : 'callout-warn'}>
-                  Cash variance against expectation: <span className="num font-semibold">{formatINR(variance)}</span>
-                  {Math.abs(variance) > 1 && ' · requires approval'}
+                <div className={needsApproval ? 'callout-warn' : 'callout-ok'}>
+                  Cash variance: <span className="num font-semibold">{formatINR(cashVariance)}</span>
+                  {' · '}Digital variance: <span className="num font-semibold">{formatINR(digitalVariance)}</span>
+                  {needsApproval && ' · requires approval'}
                 </div>
+                {existing?.status === 'APPROVED' && (
+                  <Field label="Revision reason" hint="Required when changing an approved reconciliation (at least 10 characters)">
+                    <Input value={revisionReason} onChange={(e) => setRevisionReason(e.target.value)} placeholder="Why is this approved reconciliation being revised?" />
+                  </Field>
+                )}
                 <Field label="Notes">
                   <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Counted by, denominations, variance explanation…" />
                 </Field>
                 <div className="flex justify-end">
-                  <Button variant="primary" loading={submit.isPending} disabled={!can('reconciliation.write')} onClick={() => submit.mutate()}>
-                    Save reconciliation
+                  <Button
+                    variant="primary"
+                    loading={submit.isPending}
+                    disabled={!can('reconciliation.write') || figures.isFetching || (existing?.status === 'APPROVED' && revisionReason.trim().length < 10)}
+                    onClick={() => submit.mutate()}
+                  >
+                    {existing ? 'Save new revision' : 'Save reconciliation'}
                   </Button>
                 </div>
                 <p className="text-[11px] leading-relaxed text-ink-500">{figures.data?.note}</p>
@@ -192,7 +230,7 @@ export default function Reconciliation() {
           </div>
 
           <Card className="mt-3">
-            <CardHeader title="Reconciliation history" subtitle="Approved variances remain in the audit trail" />
+            <CardHeader title="Reconciliation history" subtitle="Insert-only revisions; only the latest revision for a date can be approved" />
             {figures.data!.history.length === 0 ? (
               <EmptyState title="No reconciliations recorded" description="Save the first reconciliation for this station." />
             ) : (
@@ -205,7 +243,8 @@ export default function Reconciliation() {
                       <th className="text-right">Cash counted</th>
                       <th className="text-right">Digital expected</th>
                       <th className="text-right">Digital settled</th>
-                      <th className="text-right">Variance</th>
+                      <th className="text-right">Cash variance</th>
+                      <th className="text-right">Digital variance</th>
                       <th>Status</th>
                       <th>Recorded</th>
                       <th />
@@ -219,12 +258,13 @@ export default function Reconciliation() {
                         <td className="num text-right">{formatINR(row.cashCounted)}</td>
                         <td className="num text-right">{formatINR(row.digitalExpected)}</td>
                         <td className="num text-right">{formatINR(row.digitalSettled)}</td>
-                        <td className={`num text-right ${Math.abs(Number(row.variance)) > 1 ? 'text-warn' : 'text-ok'}`}>{formatINR(row.variance)}</td>
+                        <td className={`num text-right ${Math.abs(Number(row.cashVariance)) > 1 ? 'text-warn' : 'text-ok'}`}>{formatINR(row.cashVariance)}</td>
+                        <td className={`num text-right ${Math.abs(Number(row.digitalVariance)) > 1 ? 'text-warn' : 'text-ok'}`}>{formatINR(row.digitalVariance)}</td>
                         <td><StatusBadge status={row.status} /></td>
                         <td className="text-xs text-ink-500">{formatDateTime(row.createdAt)}</td>
                         <td className="text-right">
-                          {row.status === 'VARIANCE' && can('reconciliation.write') && (
-                            <Button size="sm" variant="ghost" loading={approve.isPending} onClick={() => approve.mutate(row.id)}>
+                          {row.status === 'VARIANCE' && latestIds.has(row.id) && can('reconciliation.write') && (
+                            <Button size="sm" variant="ghost" loading={approve.isPending} onClick={() => { setApproveRow(row); setApprovalNote(''); }}>
                               Approve
                             </Button>
                           )}
@@ -238,6 +278,30 @@ export default function Reconciliation() {
           </Card>
         </>
       ) : null}
+
+      <Modal
+        open={Boolean(approveRow)}
+        onClose={() => setApproveRow(null)}
+        title="Approve reconciliation variance"
+        description={approveRow ? `${formatDate(approveRow.businessDate)} · cash ${formatINR(approveRow.cashVariance)} · digital ${formatINR(approveRow.digitalVariance)}` : undefined}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setApproveRow(null)}>Cancel</Button>
+            <Button
+              variant="primary"
+              loading={approve.isPending}
+              disabled={approvalNote.trim().length < 3}
+              onClick={() => approveRow && approve.mutate({ id: approveRow.id, note: approvalNote.trim() })}
+            >
+              Approve variance
+            </Button>
+          </>
+        }
+      >
+        <Field label="Approval note" hint="Record who reviewed the variance and the accepted explanation (at least 3 characters).">
+          <Textarea value={approvalNote} onChange={(e) => setApprovalNote(e.target.value)} placeholder="Reviewed by …; shortage/excess explained by …" />
+        </Field>
+      </Modal>
     </>
   );
 }

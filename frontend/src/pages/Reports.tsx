@@ -578,7 +578,7 @@ function ExportsCard({ stationId }: { stationId: string }) {
     try {
       await apiDownload(pathOf(slug), filename);
     } catch (error) {
-      window.alert((error as Error).message);
+      toast('Export failed', { tone: 'danger', description: (error as Error).message });
     } finally {
       setBusy('');
     }
@@ -596,7 +596,7 @@ function ExportsCard({ stationId }: { stationId: string }) {
       });
       toast(mode === 'whatsapp' ? 'Opened WhatsApp' : 'Report shared', { description: 'The CSV is ready to send.' });
     } catch (error) {
-      window.alert((error as Error).message);
+      toast('Export failed', { tone: 'danger', description: (error as Error).message });
     } finally {
       setBusy('');
     }

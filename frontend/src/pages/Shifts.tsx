@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useIdempotencyTracker } from '../lib/idempotency';
 import { useSearchParams } from 'react-router-dom';
 import { CASH_DENOMINATIONS } from '@petroflow/shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -174,13 +175,15 @@ export default function Shifts() {
     if (id) void queryClient.invalidateQueries({ queryKey: ['shift', id] });
   };
 
+  const openKeys = useIdempotencyTracker('shift-open');
   const openMutation = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost<ShiftDetail>('/shifts', payload),
+    mutationFn: (payload: Record<string, unknown>) => apiPost<ShiftDetail>('/shifts', payload, openKeys.keyFor(payload)),
     onSuccess: (shift) => {
       toast('Shift opened', { description: `Shift #${shift.shiftNumber} started at ${shift.stationName}.` });
       if (shift.warnings?.length) {
         toast('Opening warnings', { tone: 'warning', description: shift.warnings[0] });
       }
+      openKeys.reset();
       closeOpenModal();
       setSelectedId(shift.id);
       invalidate(shift.id);
@@ -197,9 +200,10 @@ export default function Shifts() {
     onError: (error) => toast('Preview failed', { tone: 'danger', description: (error as Error).message }),
   });
 
+  const closeKeys = useIdempotencyTracker('shift-close');
   const closeMutation = useMutation({
     mutationFn: ({ id, payload }: { id: string; payload: Record<string, unknown> }) =>
-      apiPost<ShiftDetail>(`/shifts/${id}/close`, payload),
+      apiPost<ShiftDetail>(`/shifts/${id}/close`, payload, closeKeys.keyFor({ id, payload })),
     onSuccess: (shift) => {
       toast(shift.status === 'FLAGGED' ? 'Shift closed with variance flags' : 'Shift closed', {
         tone: shift.status === 'FLAGGED' ? 'warning' : 'success',
@@ -208,6 +212,7 @@ export default function Shifts() {
             ? 'Resolve the flagged nozzle readings and approve the shift.'
             : `${formatLitres(shift.totals.litres)} · ${formatINR(shift.totals.value)} aggregate estimated sales.`,
       });
+      closeKeys.reset();
       setCloseModal(false);
       invalidate(shift.id);
     },
@@ -223,11 +228,13 @@ export default function Shifts() {
     onError: (error) => toast('Approval failed', { tone: 'danger', description: (error as Error).message }),
   });
 
+  const reverseKeys = useIdempotencyTracker('shift-reverse');
   const reverseMutation = useMutation({
     mutationFn: ({ id, reason }: { id: string; reason: string }) =>
-      apiPost<ShiftDetail>(`/shifts/${id}/reverse`, { reason }),
+      apiPost<ShiftDetail>(`/shifts/${id}/reverse`, { reason }, reverseKeys.keyFor({ id, reason })),
     onSuccess: (shift) => {
       toast('Shift reversed', { tone: 'warning', description: 'Stock movements were reversed with an audit record.' });
+      reverseKeys.reset();
       setReverseModal(false);
       invalidate(shift.id);
     },
@@ -851,14 +858,16 @@ function DayClosingCard({ stationId, canManage }: { stationId: string; canManage
   });
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ['day-closings'] });
+  const dayCloseKeys = useIdempotencyTracker('day-close');
   const closeDay = useMutation({
-    mutationFn: () => apiPost('/shifts/day-close', { stationId, businessDate: date }),
-    onSuccess: () => { toast('Business day closed', { description: `Entries for ${date} are now locked.` }); invalidate(); },
+    mutationFn: () => apiPost('/shifts/day-close', { stationId, businessDate: date }, dayCloseKeys.keyFor({ stationId, date })),
+    onSuccess: () => { dayCloseKeys.reset(); toast('Business day closed', { description: `Entries for ${date} are now locked.` }); invalidate(); },
     onError: (error: Error) => toast('Could not close day', { tone: 'danger', description: error.message }),
   });
+  const reopenKeys = useIdempotencyTracker('day-reopen');
   const reopenDay = useMutation({
-    mutationFn: () => apiPost('/shifts/day-close/reopen', { stationId, businessDate: reopenFor?.businessDate, reason: reason.trim() }),
-    onSuccess: () => { toast('Business day reopened'); setReopenFor(null); setReason(''); invalidate(); },
+    mutationFn: () => apiPost('/shifts/day-close/reopen', { stationId, businessDate: reopenFor?.businessDate, reason: reason.trim() }, reopenKeys.keyFor({ stationId, date: reopenFor?.businessDate, reason: reason.trim() })),
+    onSuccess: () => { reopenKeys.reset(); toast('Business day reopened'); setReopenFor(null); setReason(''); invalidate(); },
     onError: (error: Error) => toast('Could not reopen day', { tone: 'danger', description: error.message }),
   });
 

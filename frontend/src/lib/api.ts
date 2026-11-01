@@ -57,15 +57,24 @@ interface ApiResponse<T> {
 
 async function requestWithMeta<T>(path: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
   const previewToken = getPreviewSessionToken();
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      'content-type': 'application/json',
-      ...(options.headers ?? {}),
-      ...(previewToken ? { authorization: `Bearer ${previewToken}` } : {}),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      credentials: 'include',
+      ...options,
+      headers: {
+        'content-type': 'application/json',
+        ...(options.headers ?? {}),
+        ...(previewToken ? { authorization: `Bearer ${previewToken}` } : {}),
+      },
+    });
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    throw new ApiError(0, {
+      code: 'NETWORK_ERROR',
+      message: 'Could not reach PetroFlow. Check your connection and retry. If you were saving, retry the same unchanged form before creating a new entry.',
+    });
+  }
 
   if (res.status === 204) return { data: undefined as T };
   const text = await res.text();
@@ -146,10 +155,15 @@ export function apiDelete<T>(path: string): Promise<T> {
 /** Authenticated file download (CSV exports etc.) — same cookie/Bearer rules as request(). */
 async function fetchBlob(path: string): Promise<Blob> {
   const previewToken = getPreviewSessionToken();
-  const res = await fetch(`${BASE}${path}`, {
-    credentials: 'include',
-    headers: { ...(previewToken ? { authorization: `Bearer ${previewToken}` } : {}) },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      credentials: 'include',
+      headers: { ...(previewToken ? { authorization: `Bearer ${previewToken}` } : {}) },
+    });
+  } catch {
+    throw new ApiError(0, { code: 'NETWORK_ERROR', message: 'Could not download the report. Check your connection and retry.' });
+  }
   if (!res.ok) {
     let message = 'Download failed';
     try {
