@@ -141,12 +141,21 @@ public final class Auth {
 
     public static void audit(Auth auth, String action, String entity, String entityId, String stationId, String summary) {
         try {
-            Db.exec(
+            auditRequired(auth, action, entity, entityId, stationId, summary, null, null);
+        } catch (RuntimeException ignored) {
+            /* Legacy non-financial audit remains best effort. Financial callers use auditRequired. */
+        }
+    }
+
+    /** Financial audit write participates in the caller's transaction; failure rolls the operation back. */
+    public static void auditRequired(Auth auth, String action, String entity, String entityId, String stationId,
+                                     String summary, Map<String, Object> before, Map<String, Object> after) {
+        Db.exec(
                     """
                     INSERT INTO audit_logs
                       (id, tenant_id, station_id, actor_id, actor_email, actor_role, action, entity, entity_id,
-                       summary, ip, user_agent, is_demo, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                       summary, before_data, after_data, ip, user_agent, is_demo, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                     """,
                     Clock.newId("aud"),
                     auth == null ? null : auth.tenantId,
@@ -155,11 +164,10 @@ public final class Auth {
                     auth == null ? null : auth.email,
                     auth == null ? null : auth.roleKey,
                     action, entity, entityId, summary,
+                    before == null ? null : Json.stringify(Json.shape(before)),
+                    after == null ? null : Json.stringify(Json.shape(after)),
                     auth != null && auth.demo ? 1 : 0,
                     Clock.nowIso());
-        } catch (RuntimeException ignored) {
-            /* audit must not break the request */
-        }
     }
 
     public static List<String> grants(Object raw) {

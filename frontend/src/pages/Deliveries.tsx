@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Download, PackageCheck, Plus, Scale, Truck } from 'lucide-react';
 import { apiGet, apiList, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyTracker } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, formatNumber } from '../lib/format';
 import { downloadCsv } from '../lib/utils';
@@ -117,30 +118,34 @@ export default function Deliveries() {
     void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
   };
 
+  const createKeys = useIdempotencyTracker('delivery-create');
   const create = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/deliveries', payload),
-    onSuccess: () => { toast('Delivery recorded'); closeCreate(); invalidate(); },
+    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/deliveries', payload, createKeys.keyFor(payload)),
+    onSuccess: () => { createKeys.reset(); toast('Delivery recorded'); closeCreate(); invalidate(); },
     onError: (e) => toast('Could not record delivery', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const receiveKeys = useIdempotencyTracker('delivery-receive');
   const receive = useMutation({
     mutationFn: ({ id, payload }: { id: string; payload: Record<string, unknown> }) =>
-      apiPost<Delivery & { discrepancyLitres?: string }>(`/inventory/deliveries/${id}/receive`, payload),
+      apiPost<Delivery & { discrepancyLitres?: string }>(`/inventory/deliveries/${id}/receive`, payload, receiveKeys.keyFor({ id, payload })),
     onSuccess: (row: Delivery & { discrepancyLitres?: string }) => {
       const discrepancy = Number(row.discrepancyLitres ?? 0);
       toast('Delivery received into tank', {
         tone: Math.abs(discrepancy) > 0.5 ? 'warning' : 'success',
         description: `${formatNumber(row.receivedLitres ?? '0', 3)} L accepted${Math.abs(discrepancy) > 0.001 ? ` · ${formatNumber(row.discrepancyLitres!, 3)} L variance vs invoice` : ''}`,
       });
+      receiveKeys.reset();
       setReceiveDelivery(null);
       invalidate();
     },
     onError: (e) => toast('Could not receive delivery', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const disputeKeys = useIdempotencyTracker('delivery-dispute');
   const dispute = useMutation({
-    mutationFn: ({ id, reason }: { id: string; reason: string }) => apiPost(`/inventory/deliveries/${id}/dispute`, { reason }),
-    onSuccess: () => { toast('Delivery marked disputed', { tone: 'warning' }); setDisputeDelivery(null); invalidate(); },
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => apiPost(`/inventory/deliveries/${id}/dispute`, { reason }, disputeKeys.keyFor({ id, reason })),
+    onSuccess: () => { disputeKeys.reset(); toast('Delivery marked disputed', { tone: 'warning' }); setDisputeDelivery(null); invalidate(); },
     onError: (e) => toast('Could not dispute delivery', { tone: 'danger', description: (e as Error).message }),
   });
 

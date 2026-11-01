@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Banknote, BookOpen, Plus, Truck } from 'lucide-react';
-import { apiGet, apiList, apiPatch, apiPost, idempotencyKey, type ListMeta } from '../lib/api';
+import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, todayIst } from '../lib/format';
 import {
@@ -91,14 +92,17 @@ export default function Suppliers() {
   });
 
   const ledger = useQuery({
-    queryKey: ['supplier-ledger', ledgerSupplier?.id],
-    queryFn: () => apiGet<Ledger>(`/finance/supplier-ledger?supplierId=${ledgerSupplier!.id}`),
+    queryKey: ['supplier-ledger', ledgerSupplier?.id, stationId],
+    queryFn: () => apiGet<Ledger>(`/finance/supplier-ledger?supplierId=${ledgerSupplier!.id}&stationId=${stationId}`),
     enabled: Boolean(ledgerSupplier),
   });
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['suppliers'] });
     void queryClient.invalidateQueries({ queryKey: ['supplier-ledger'] });
+    void queryClient.invalidateQueries({ queryKey: ['payments'] });
+    void queryClient.invalidateQueries({ queryKey: ['finance-summary'] });
+    void queryClient.invalidateQueries({ queryKey: ['reconciliation'] });
     void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
   };
 
@@ -342,23 +346,16 @@ function SupplierPaymentModal({
   const [reference, setReference] = useState('');
   const [occurredAt, setOccurredAt] = useState('');
 
+  const payload = {
+    stationId, direction: 'PAYOUT', partyType: 'SUPPLIER', supplierId: supplier.id,
+    amount, mode, reference: reference || undefined,
+    occurredAt: occurredAt || undefined,
+  };
+  const idempotency = useIdempotencyKey('payout', payload);
   const mutation = useMutation({
-    mutationFn: () =>
-      apiPost(
-        '/finance/payments',
-        {
-          stationId,
-          direction: 'PAYOUT',
-          partyType: 'SUPPLIER',
-          supplierId: supplier.id,
-          amount,
-          mode,
-          reference: reference || undefined,
-          occurredAt: occurredAt ? new Date(occurredAt).toISOString() : undefined,
-        },
-        idempotencyKey('payout'),
-      ),
+    mutationFn: () => apiPost('/finance/payments', payload, idempotency.key),
     onSuccess: () => {
+      idempotency.reset();
       toast('Supplier payment recorded');
       onDone();
     },

@@ -48,6 +48,21 @@ public final class ShiftApi {
             where += " AND s.business_date = ?";
             queryParams.add(ctx.q("businessDate"));
         }
+        String from = ctx.q("from");
+        String to = ctx.q("to");
+        if (from != null && !from.isBlank()) {
+            if (!Clock.isIsoDate(from)) throw ApiException.validation("from", "from must be YYYY-MM-DD");
+            where += " AND s.business_date >= ?";
+            queryParams.add(from);
+        }
+        if (to != null && !to.isBlank()) {
+            if (!Clock.isIsoDate(to)) throw ApiException.validation("to", "to must be YYYY-MM-DD");
+            where += " AND s.business_date <= ?";
+            queryParams.add(to);
+        }
+        if (from != null && to != null && !from.isBlank() && !to.isBlank() && from.compareTo(to) > 0) {
+            throw ApiException.validation("to", "to must be on or after from");
+        }
         long total = Db.count("SELECT COUNT(*) AS count FROM shifts s WHERE " + where, queryParams.toArray());
         queryParams.add(size);
         queryParams.add((page - 1) * size);
@@ -102,19 +117,23 @@ public final class ShiftApi {
         String date = required(ctx, "businessDate");
         if (!Clock.isIsoDate(date)) throw ApiException.validation("businessDate", "Enter a valid YYYY-MM-DD date");
         if (date.compareTo(Clock.todayIst()) > 0) throw ApiException.unprocessable("A future business date cannot be closed");
-        Map<String, Object> open = Db.one("SELECT id, shift_number, business_date FROM shifts WHERE station_id = ? AND status = 'OPEN' AND business_date <= ? LIMIT 1", station.get("id"), date);
-        if (open != null) throw ApiException.conflict("Shift #" + open.get("shift_number") + " (" + open.get("business_date") + ") is still open — close it before closing the day.");
-        Map<String, Object> existing = Db.one("SELECT id, status FROM day_closings WHERE station_id = ? AND business_date = ?", station.get("id"), date);
-        if (existing != null && "CLOSED".equals(existing.get("status"))) throw ApiException.conflict("Business date " + date + " is already closed");
-        String id = existing == null ? Clock.newId("dcl") : Db.str(existing, "id");
-        if (existing == null) {
-            Db.exec("INSERT INTO day_closings (id, tenant_id, station_id, business_date, status, closed_by, closed_at, notes, created_at) VALUES (?, ?, ?, ?, 'CLOSED', ?, ?, ?, ?)",
-                    id, station.get("tenant_id"), station.get("id"), date, auth.userId, Clock.nowIso(), ctx.str("notes"), Clock.nowIso());
-        } else {
-            Db.exec("UPDATE day_closings SET status = 'CLOSED', closed_by = ?, closed_at = ?, notes = COALESCE(?, notes) WHERE id = ?", auth.userId, Clock.nowIso(), ctx.str("notes"), id);
-        }
-        Auth.audit(auth, "DAY_CLOSED", "DayClosing", id, Db.str(station, "id"), "Business date " + date + " closed");
-        ctx.created(Json.shape(Db.one("SELECT * FROM day_closings WHERE id = ?", id)));
+        Map<String, Object> saved = Db.tx(() -> {
+            Db.one("SELECT id FROM stations WHERE id = ? FOR UPDATE", station.get("id"));
+            Map<String, Object> open = Db.one("SELECT id, shift_number, business_date FROM shifts WHERE station_id = ? AND status IN ('OPEN','FLAGGED') AND business_date <= ? LIMIT 1", station.get("id"), date);
+            if (open != null) throw ApiException.conflict("Shift #" + open.get("shift_number") + " (" + open.get("business_date") + ") is still open/flagged — close and approve it before closing the day.");
+            Map<String, Object> existing = Db.one("SELECT id, status FROM day_closings WHERE station_id = ? AND business_date = ? FOR UPDATE", station.get("id"), date);
+            if (existing != null && "CLOSED".equals(existing.get("status"))) throw ApiException.conflict("Business date " + date + " is already closed");
+            String id = existing == null ? Clock.newId("dcl") : Db.str(existing, "id");
+            if (existing == null) {
+                Db.exec("INSERT INTO day_closings (id, tenant_id, station_id, business_date, status, closed_by, closed_at, notes, created_at) VALUES (?, ?, ?, ?, 'CLOSED', ?, ?, ?, ?)",
+                        id, station.get("tenant_id"), station.get("id"), date, auth.userId, Clock.nowIso(), ctx.str("notes"), Clock.nowIso());
+            } else {
+                Db.exec("UPDATE day_closings SET status = 'CLOSED', closed_by = ?, closed_at = ?, notes = COALESCE(?, notes) WHERE id = ?", auth.userId, Clock.nowIso(), ctx.str("notes"), id);
+            }
+            Auth.auditRequired(auth, "DAY_CLOSED", "DayClosing", id, Db.str(station, "id"), "Business date " + date + " closed", existing, Db.one("SELECT * FROM day_closings WHERE id = ?", id));
+            return Db.one("SELECT * FROM day_closings WHERE id = ?", id);
+        });
+        ctx.created(Json.shape(saved));
     }
 
     private static void reopen(Web.Ctx ctx) {
@@ -124,10 +143,16 @@ public final class ShiftApi {
         String date = required(ctx, "businessDate");
         String reason = required(ctx, "reason");
         if (reason.length() < 10) throw ApiException.validation("reason", "Reason must be at least 10 characters");
-        Map<String, Object> existing = Db.one("SELECT id, status FROM day_closings WHERE station_id = ? AND business_date = ?", station.get("id"), date);
-        if (existing == null || !"CLOSED".equals(existing.get("status"))) throw ApiException.conflict("Business date " + date + " is not closed");
-        Db.exec("UPDATE day_closings SET status = 'REOPENED', reopened_by = ?, reopened_at = ?, reopen_reason = ? WHERE id = ?", auth.userId, Clock.nowIso(), reason, existing.get("id"));
-        ctx.ok(Json.shape(Db.one("SELECT * FROM day_closings WHERE id = ?", existing.get("id"))));
+        Map<String, Object> reopened = Db.tx(() -> {
+            Db.one("SELECT id FROM stations WHERE id = ? FOR UPDATE", station.get("id"));
+            Map<String, Object> existing = Db.one("SELECT * FROM day_closings WHERE station_id = ? AND business_date = ? FOR UPDATE", station.get("id"), date);
+            if (existing == null || !"CLOSED".equals(existing.get("status"))) throw ApiException.conflict("Business date " + date + " is not closed");
+            Db.exec("UPDATE day_closings SET status = 'REOPENED', reopened_by = ?, reopened_at = ?, reopen_reason = ? WHERE id = ?", auth.userId, Clock.nowIso(), reason, existing.get("id"));
+            Map<String, Object> after = Db.one("SELECT * FROM day_closings WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "DAY_REOPENED", "DayClosing", Db.str(existing, "id"), Db.str(station, "id"), "Business date " + date + " reopened: " + reason, existing, after);
+            return after;
+        });
+        ctx.ok(Json.shape(reopened));
     }
 
     private static void detail(Web.Ctx ctx) {
@@ -142,10 +167,15 @@ public final class ShiftApi {
         Map<String, Object> station = auth.station(required(ctx, "stationId"));
         String date = ctx.str("businessDate") == null ? Clock.todayIst() : ctx.str("businessDate");
         if (!Clock.isIsoDate(date)) throw ApiException.validation("businessDate", "Enter a valid YYYY-MM-DD date");
-        Domain.assertDayOpen(Db.str(station, "id"), date);
-        Map<String, Object> open = Db.one("SELECT id, shift_number FROM shifts WHERE station_id = ? AND status IN ('OPEN','FLAGGED') LIMIT 1", station.get("id"));
-        if (open != null) throw ApiException.conflict("Shift #" + open.get("shift_number") + " is still open. Close it before opening a new shift.");
-        int number = (int) Db.count("SELECT COALESCE(MAX(shift_number), 0) + 1 AS count FROM shifts WHERE station_id = ? AND business_date = ?", station.get("id"), date);
+        String operatorId = ctx.str("operatorId") == null || ctx.str("operatorId").isBlank() ? auth.userId : ctx.str("operatorId").trim();
+        Map<String, Object> operator = Db.one("SELECT id, status FROM users WHERE id = ? AND tenant_id = ?", operatorId, auth.tenantId());
+        if (operator == null || !"ACTIVE".equals(Db.str(operator, "status"))) throw ApiException.validation("operatorId", "Operator must be an active user in this tenant");
+        if (!auth.allStations && !auth.stationIds.contains(Db.str(station, "id"))) throw ApiException.forbidden();
+        if (Db.one("SELECT 1 AS ok FROM user_station_access WHERE user_id = ? AND station_id = ?", operatorId, station.get("id")) == null
+                && Db.one("SELECT 1 AS ok FROM users WHERE id = ? AND role_key = 'OWNER'", operatorId) == null) {
+            throw ApiException.validation("operatorId", "Operator is not assigned to this station");
+        }
+        BigDecimal openingCash = FinanceRules.nonNegativeMoney(ctx.str("openingCash") == null ? "0" : ctx.str("openingCash"), "openingCash");
         List<Map<String, Object>> nozzles = Db.all("SELECT * FROM nozzles WHERE station_id = ? AND status = 'ACTIVE' ORDER BY number", station.get("id"));
         if (nozzles.isEmpty()) throw ApiException.unprocessable("Configure nozzles before opening a shift");
         for (Map<String, Object> nozzle : nozzles) {
@@ -164,6 +194,11 @@ public final class ShiftApi {
         String id = Clock.newId("shf");
         String now = Clock.nowIso();
         Db.tx(() -> {
+            Db.one("SELECT id FROM stations WHERE id = ? FOR UPDATE", station.get("id"));
+            Domain.assertDayOpen(Db.str(station, "id"), date);
+            Map<String, Object> open = Db.one("SELECT id, shift_number FROM shifts WHERE station_id = ? AND status IN ('OPEN','FLAGGED') LIMIT 1", station.get("id"));
+            if (open != null) throw ApiException.conflict("Shift #" + open.get("shift_number") + " is still open. Close it before opening a new shift.");
+            int number = (int) Db.count("SELECT COALESCE(MAX(shift_number), 0) + 1 AS count FROM shifts WHERE station_id = ? AND business_date = ?", station.get("id"), date);
             Db.exec(
                     """
                     INSERT INTO shifts
@@ -172,8 +207,8 @@ public final class ShiftApi {
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', '0', '0', ?, '0', ?, 0, ?, ?)
                     """,
                     id, station.get("tenant_id"), station.get("id"), number, date, now,
-                    ctx.str("operatorId") == null ? auth.userId : ctx.str("operatorId"), auth.userId,
-                    Money.rate(ctx.str("openingCash") == null ? "0" : ctx.str("openingCash")), ctx.str("notes"), now, now);
+                    operatorId, auth.userId,
+                    Money.money(openingCash), ctx.str("notes"), now, now);
             for (Map<String, Object> nozzle : nozzles) {
                 Map<String, Object> latest = Db.one("SELECT id, reading_value FROM meter_readings WHERE nozzle_id = ? AND is_countable = 1 ORDER BY reading_at DESC LIMIT 1", nozzle.get("id"));
                 Db.exec(
@@ -189,8 +224,8 @@ public final class ShiftApi {
             }
             return id;
         });
-        Auth.audit(auth, "SHIFT_OPENED", "Shift", id, Db.str(station, "id"), "Shift #" + number + " opened for " + date);
         Map<String, Object> detail = detailOf(Db.one("SELECT * FROM shifts WHERE id = ?", id));
+        Auth.audit(auth, "SHIFT_OPENED", "Shift", id, Db.str(station, "id"), "Shift #" + detail.get("shiftNumber") + " opened for " + date);
         detail.put("warnings", List.of());
         ctx.created(detail);
     }
@@ -205,10 +240,12 @@ public final class ShiftApi {
     private static void close(Web.Ctx ctx) {
         Auth auth = ctx.requireAuth();
         auth.require("shifts.close");
-        Map<String, Object> shift = load(auth, ctx.p("id"));
-        if (!"OPEN".equals(shift.get("status"))) throw ApiException.conflict("This shift is not open");
-        Domain.assertDayOpen(Db.str(shift, "station_id"), Db.str(shift, "business_date"));
         Db.tx(() -> {
+            Map<String, Object> shift = Db.one("SELECT * FROM shifts WHERE id = ? AND tenant_id = ? FOR UPDATE", ctx.p("id"), auth.tenantId());
+            if (shift == null) throw ApiException.notFound("Shift not found");
+            auth.station(Db.str(shift, "station_id"));
+            if (!"OPEN".equals(shift.get("status"))) throw ApiException.conflict("This shift is not open");
+            Domain.assertDayOpen(Db.str(shift, "station_id"), Db.str(shift, "business_date"));
             List<Map<String, Object>> ops = closings(shift, true);
             BigDecimal litres = BigDecimal.ZERO;
             BigDecimal value = BigDecimal.ZERO;
@@ -221,7 +258,7 @@ public final class ShiftApi {
                     if (op.get("tankId") != null) {
                         Domain.movement(Db.str(shift, "tenant_id"), Db.str(shift, "station_id"), Db.str(op, "tankId"), Db.str(op, "productId"),
                                 "DISPENSED", Money.litres(op.get("litres")), "SHIFT", Db.str(shift, "id"),
-                                "Dispensed during shift #" + shift.get("shift_number"), auth.userId, Db.num(shift, "is_demo") == 1);
+                                "Dispensed during shift #" + shift.get("shift_number"), auth.userId, Db.num(shift, "is_demo") == 1, Db.str(shift, "opened_at"));
                     }
                 }
                 Db.exec(
@@ -235,36 +272,67 @@ public final class ShiftApi {
                         op.get("value"), op.get("variance"), op.get("status"), op.get("note"), Clock.nowIso(), op.get("rowId"));
             }
             String status = flagged ? "FLAGGED" : "CLOSED";
-            String closingCash = Money.money(ctx.str("closingCash") == null ? "0" : ctx.str("closingCash"));
+            BigDecimal closingCash = FinanceRules.nonNegativeMoney(ctx.str("closingCash") == null ? "0" : ctx.str("closingCash"), "closingCash");
             BigDecimal nonCashReceived = BigDecimal.ZERO;
             String now = Clock.nowIso();
+            Map<String, String> recvByMode = new LinkedHashMap<>();
+            if (ctx.body().get("settlements") instanceof List<?> stmts) {
+                for (Object item : stmts) {
+                    Map<String, Object> s = Json.object(item);
+                    String m = Db.str(s, "mode") == null ? "" : Db.str(s, "mode").trim().toUpperCase(java.util.Locale.ROOT);
+                    if (!List.of("CASH", "UPI", "CARD", "BANK", "CREDIT").contains(m)) {
+                        throw ApiException.validation("settlements", "Settlement mode must be CASH, UPI, CARD, BANK or CREDIT");
+                    }
+                    if (recvByMode.containsKey(m)) throw ApiException.validation("settlements", "Duplicate settlement mode: " + m);
+                    String r = s.get("received") != null ? String.valueOf(s.get("received")) : Db.str(s, "receivedAmount");
+                    recvByMode.put(m, Money.money(FinanceRules.nonNegativeMoney(r == null ? "0" : r, "settlements." + m)));
+                }
+            }
+            if (recvByMode.containsKey("CASH") && Money.d(recvByMode.get("CASH")).compareTo(closingCash) != 0) {
+                throw ApiException.validation("closingCash", "closingCash must equal the CASH settlement received amount");
+            }
+            recvByMode.putIfAbsent("CASH", Money.money(closingCash));
+            BigDecimal denominationTotal = BigDecimal.ZERO;
+            boolean hasDenominations = false;
             if (ctx.body().get("denominations") instanceof List<?> denoms) {
                 Db.exec("DELETE FROM shift_cash_denominations WHERE shift_id = ?", shift.get("id"));
+                java.util.Set<Integer> seenDenoms = new java.util.HashSet<>();
                 for (Object item : denoms) {
                     Map<String, Object> d = Json.object(item);
-                    int denom = (int) Db.num(d, "denomination");
-                    int count = (int) Db.num(d, "count");
-                    if (denom > 0 && count > 0) {
+                    BigDecimal denomValue;
+                    BigDecimal countValue;
+                    try {
+                        denomValue = new BigDecimal(String.valueOf(d.get("denomination")));
+                        countValue = new BigDecimal(String.valueOf(d.get("count")));
+                    } catch (NumberFormatException ex) {
+                        throw ApiException.validation("denominations", "Denomination and count must be valid numbers");
+                    }
+                    if (denomValue.stripTrailingZeros().scale() > 0 || countValue.stripTrailingZeros().scale() > 0
+                            || denomValue.signum() <= 0 || countValue.signum() < 0) {
+                        throw ApiException.validation("denominations", "Denomination must be positive and count must be a non-negative whole number");
+                    }
+                    int denom = denomValue.intValueExact();
+                    int count = countValue.intValueExact();
+                    if (!List.of(1, 2, 5, 10, 20, 50, 100, 200, 500).contains(denom)) {
+                        throw ApiException.validation("denominations", "Unsupported INR denomination: " + denom);
+                    }
+                    if (!seenDenoms.add(denom)) throw ApiException.validation("denominations", "Duplicate denomination: " + denom);
+                    hasDenominations = true;
+                    denominationTotal = denominationTotal.add(BigDecimal.valueOf((long) denom * count));
+                    if (count > 0) {
                         Db.exec("INSERT INTO shift_cash_denominations (id, shift_id, denomination, count, amount) VALUES (?, ?, ?, ?, ?)",
                                 Clock.newId("scd"), shift.get("id"), denom, count, Money.money(BigDecimal.valueOf((long) denom * count)));
                     }
                 }
             }
-            Map<String, String> recvByMode = new LinkedHashMap<>();
-            if (ctx.body().get("settlements") instanceof List<?> stmts) {
-                for (Object item : stmts) {
-                    Map<String, Object> s = Json.object(item);
-                    String m = Db.str(s, "mode");
-                    String r = s.get("received") != null ? String.valueOf(s.get("received")) : Db.str(s, "receivedAmount");
-                    if (m != null && r != null && !r.isBlank()) recvByMode.put(m, Money.money(r));
-                }
+            if (hasDenominations && denominationTotal.compareTo(closingCash) != 0) {
+                throw ApiException.validation("denominations", "Denomination total " + Money.money(denominationTotal) + " must equal closing cash " + Money.money(closingCash));
             }
-            recvByMode.putIfAbsent("CASH", closingCash);
             for (String m : List.of("UPI", "CARD", "BANK", "CREDIT")) {
                 if (recvByMode.containsKey(m)) nonCashReceived = nonCashReceived.add(Money.d(recvByMode.get(m)));
             }
             BigDecimal expectedCash = Money.d(shift.get("opening_cash")).add(value).subtract(nonCashReceived);
-            BigDecimal shortExcess = Money.d(closingCash).subtract(expectedCash);
+            BigDecimal shortExcess = closingCash.subtract(expectedCash);
             Db.exec("DELETE FROM shift_settlements WHERE shift_id = ?", shift.get("id"));
             for (String m : List.of("CASH", "UPI", "CARD", "BANK", "CREDIT")) {
                 if (!recvByMode.containsKey(m) && !"CASH".equals(m)) continue;
@@ -284,11 +352,12 @@ public final class ShiftApi {
                            closing_cash = ?, cash_counted = ?, short_excess = ?, close_notes = ?, updated_at = ? WHERE id = ?
                     """,
                     status, now, auth.userId, Money.litres(litres), Money.money(value),
-                    closingCash, closingCash, Money.money(shortExcess), ctx.str("notes"), now, shift.get("id"));
+                    Money.money(closingCash), Money.money(closingCash), Money.money(shortExcess), ctx.str("notes"), now, shift.get("id"));
+            Auth.auditRequired(auth, "SHIFT_CLOSED", "Shift", Db.str(shift, "id"), Db.str(shift, "station_id"),
+                    "Shift #" + shift.get("shift_number") + " closed: " + Money.litres(litres) + " L / " + Money.money(value), null, Db.one("SELECT * FROM shifts WHERE id = ?", shift.get("id")));
             return status;
         });
-        Auth.audit(auth, "SHIFT_CLOSED", "Shift", Db.str(shift, "id"), Db.str(shift, "station_id"), "Shift closed");
-        Map<String, Object> out = detailOf(Db.one("SELECT * FROM shifts WHERE id = ?", shift.get("id")));
+        Map<String, Object> out = detailOf(Db.one("SELECT * FROM shifts WHERE id = ?", ctx.p("id")));
         out.put("warnings", List.of());
         ctx.ok(out);
     }
@@ -314,7 +383,9 @@ public final class ShiftApi {
         String reason = required(ctx, "reason").trim();
         if (reason.length() < 10) throw ApiException.validation("reason", "Reason must be at least 10 characters");
         Map<String, Object> reversed = Db.tx(() -> {
-            Map<String, Object> shift = load(auth, shiftId);
+            Map<String, Object> shift = Db.one("SELECT * FROM shifts WHERE id = ? AND tenant_id = ? FOR UPDATE", shiftId, auth.tenantId());
+            if (shift == null) throw ApiException.notFound("Shift not found");
+            auth.station(Db.str(shift, "station_id"));
             String currentStatus = Db.str(shift, "status");
             if ("REVERSED".equals(currentStatus)) {
                 throw ApiException.conflict("This shift has already been reversed");
@@ -331,7 +402,7 @@ public final class ShiftApi {
             String now = Clock.nowIso();
             Db.exec("UPDATE shifts SET status = 'REVERSED', close_notes = ?, updated_at = ? WHERE id = ?", "REVERSED: " + reason, now, shift.get("id"));
             Db.exec("UPDATE shift_nozzle_readings SET status = 'REVERSED', updated_at = ? WHERE shift_id = ?", now, shift.get("id"));
-            Auth.audit(auth, "SHIFT_REVERSED", "Shift", Db.str(shift, "id"), Db.str(shift, "station_id"), "Shift #" + shift.get("shift_number") + " reversed: " + reason);
+            Auth.auditRequired(auth, "SHIFT_REVERSED", "Shift", Db.str(shift, "id"), Db.str(shift, "station_id"), "Shift #" + shift.get("shift_number") + " reversed: " + reason, null, Db.one("SELECT * FROM shifts WHERE id = ?", shift.get("id")));
             return detailOf(Db.one("SELECT * FROM shifts WHERE id = ?", shift.get("id")));
         });
         ctx.ok(reversed);
@@ -347,7 +418,11 @@ public final class ShiftApi {
         List<Object> params = new ArrayList<>();
         if (ctx.body().containsKey("openingReading")) { sets.add("opening_reading = ?"); params.add(Money.rate(ctx.str("openingReading"))); sets.add("opening_source = 'MANUAL'"); }
         if (ctx.body().containsKey("closingReading")) { sets.add("closing_reading = ?"); params.add(Money.rate(ctx.str("closingReading"))); sets.add("closing_source = 'MANUAL'"); }
-        if (ctx.body().containsKey("testingLitres")) { sets.add("testing_litres = ?"); params.add(Money.litres(ctx.str("testingLitres"))); }
+        if (ctx.body().containsKey("testingLitres")) {
+            BigDecimal testing = new BigDecimal(ctx.str("testingLitres"));
+            if (testing.signum() < 0) throw ApiException.validation("testingLitres", "testingLitres cannot be negative");
+            sets.add("testing_litres = ?"); params.add(Money.litres(testing));
+        }
         if (ctx.body().containsKey("note")) { sets.add("note = ?"); params.add(ctx.str("note")); }
         if (!sets.isEmpty()) {
             sets.add("updated_at = ?");
@@ -382,7 +457,7 @@ public final class ShiftApi {
                 }
             }
             String opening = Db.str(row, "opening_reading");
-            Map<String, Object> price = Domain.priceAt(Db.str(shift, "tenant_id"), Db.str(row, "product_id"), Db.str(shift, "station_id"));
+            Map<String, Object> price = Domain.priceAt(Db.str(shift, "tenant_id"), Db.str(row, "product_id"), Db.str(shift, "station_id"), Db.str(shift, "opened_at"));
             String rate = price == null ? "0.000" : Money.rate(price.get("rate_per_litre"));
             String status = "CAPTURED";
             String litres = null;
@@ -391,7 +466,9 @@ public final class ShiftApi {
                 status = "FLAGGED";
                 note = note == null ? "Opening or closing reading is missing" : note;
             } else {
-                BigDecimal net = Money.d(closing).subtract(Money.d(opening)).subtract(Money.d(row.get("testing_litres")));
+                BigDecimal net = Money.d(closing).subtract(Money.d(opening))
+                        .add(Money.d(row.get("adjustment_litres")))
+                        .subtract(Money.d(row.get("testing_litres")));
                 if (net.signum() < 0) status = "FLAGGED";
                 else litres = Money.litres(net);
             }

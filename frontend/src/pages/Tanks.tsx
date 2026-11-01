@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeftRight, Database, Droplets, Gauge, Plus, Ruler } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyTracker } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatINR, formatLitres, formatNumber } from '../lib/format';
 import {
@@ -135,27 +136,31 @@ export default function Tanks() {
     onError: (e) => toast('Update failed', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const dipKeys = useIdempotencyTracker('tank-dip');
   const recordDip = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost(`/catalog/tanks/${dipTank!.id}/measurements`, payload),
-    onSuccess: () => { toast('Physical dip recorded', { description: 'Book vs measured variance stored separately.' }); setDipTank(null); invalidate(); },
+    mutationFn: (payload: Record<string, unknown>) => apiPost(`/catalog/tanks/${dipTank!.id}/measurements`, payload, dipKeys.keyFor({ id: dipTank!.id, payload })),
+    onSuccess: () => { dipKeys.reset(); toast('Physical dip recorded', { description: 'Book vs measured variance stored separately.' }); setDipTank(null); invalidate(); },
     onError: (e) => toast('Could not record dip', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const adjustmentKeys = useIdempotencyTracker('stock-adjustment');
   const adjustment = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/adjustments', payload),
-    onSuccess: () => { toast('Stock adjusted'); setAdjustTank(null); invalidate(); },
+    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/adjustments', payload, adjustmentKeys.keyFor(payload)),
+    onSuccess: () => { adjustmentKeys.reset(); toast('Stock adjusted'); setAdjustTank(null); invalidate(); },
     onError: (e) => toast('Adjustment failed', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const openingKeys = useIdempotencyTracker('opening-stock');
   const opening = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/opening-stock', payload),
-    onSuccess: () => { toast('Opening stock saved'); setOpeningTank(null); invalidate(); },
+    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/opening-stock', payload, openingKeys.keyFor(payload)),
+    onSuccess: () => { openingKeys.reset(); toast('Opening stock saved'); setOpeningTank(null); invalidate(); },
     onError: (e) => toast('Could not set opening stock', { tone: 'danger', description: (e as Error).message }),
   });
 
+  const transferKeys = useIdempotencyTracker('stock-transfer');
   const transfer = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/transfers', payload),
-    onSuccess: () => { toast('Stock transferred', { description: 'Two ledger entries created (out/in).' }); setTransferOpen(false); invalidate(); },
+    mutationFn: (payload: Record<string, unknown>) => apiPost('/inventory/transfers', payload, transferKeys.keyFor(payload)),
+    onSuccess: () => { transferKeys.reset(); toast('Stock transferred', { description: 'Two ledger entries created (out/in).' }); setTransferOpen(false); invalidate(); },
     onError: (e) => toast('Transfer failed', { tone: 'danger', description: (e as Error).message }),
   });
 

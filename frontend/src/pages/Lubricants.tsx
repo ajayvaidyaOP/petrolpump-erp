@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Droplets, PackagePlus, Pencil, Plus, ShoppingCart, Truck } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatINR, formatNumber } from '../lib/format';
 import {
@@ -137,9 +138,7 @@ export default function Lubricants() {
     onError: (error: Error) => toast('Could not save item', { tone: 'danger', description: error.message }),
   });
 
-  const saveMovement = useMutation({
-    mutationFn: () =>
-      apiPost('/lubricants/movements', {
+  const movementPayload = {
         stationId,
         productId: moveForm.productId,
         type: moveType,
@@ -149,8 +148,13 @@ export default function Lubricants() {
         customerId: moveType === 'SALE' && moveForm.paymentMode === 'CREDIT' ? moveForm.customerId : undefined,
         vehicleNumber: moveForm.vehicleNumber || undefined,
         note: moveForm.note || undefined,
-      }),
+      };
+  const movementKey = useIdempotencyKey('lube-movement', movementPayload);
+  const saveMovement = useMutation({
+    mutationFn: () =>
+      apiPost('/lubricants/movements', movementPayload, movementKey.key),
     onSuccess: () => {
+      movementKey.reset();
       toast(moveType === 'SALE' ? 'Lubricant sale recorded' : 'Stock movement recorded');
       setMoveType(null);
       invalidate();

@@ -29,6 +29,7 @@ public final class BackendTests {
         testMoneyAndJson();
         testPasswordsAndPermissions();
         testMysqlConnectionInitializationWithoutDatabaseCreation();
+        testFinanceRules();
         if (!Boolean.parseBoolean(System.getenv().getOrDefault("SKIP_DB_TESTS", "false"))) {
             testHttpAndDatabaseIntegration();
         }
@@ -87,6 +88,48 @@ public final class BackendTests {
             } finally {
                 Db.close();
             }
+        }
+    }
+
+
+    private static void testFinanceRules() {
+        FinanceRules.PaymentParty receipt = FinanceRules.validatePayment("customer", "receipt", "cus_1", null, "upi");
+        check("CUSTOMER".equals(receipt.partyType()) && "RECEIPT".equals(receipt.direction()) && "cus_1".equals(receipt.customerId()),
+                "FinanceRules normalizes customer receipt");
+        FinanceRules.PaymentParty payout = FinanceRules.validatePayment("SUPPLIER", "PAYOUT", null, "sup_1", "BANK");
+        check("sup_1".equals(payout.supplierId()) && payout.customerId() == null, "FinanceRules normalizes supplier payout");
+        expectValidation(() -> FinanceRules.validatePayment("CUSTOMER", "PAYOUT", "cus_1", null, "CASH"), "customer payout rejected");
+        expectValidation(() -> FinanceRules.validatePayment("SUPPLIER", "PAYOUT", "cus_1", "sup_1", "CASH"), "mixed parties rejected");
+        expectValidation(() -> FinanceRules.validatePayment("CUSTOMER", "RECEIPT", "cus_1", null, "CREDIT"), "credit is not a settled payment mode");
+        expectValidation(() -> FinanceRules.positiveMoney("0", "amount"), "zero payment rejected");
+        expectValidation(() -> FinanceRules.positiveMoney("10.001", "amount"), "sub-paise payment rejected");
+        expectValidation(() -> FinanceRules.nonNegativeMoney("-1", "cashCounted"), "negative counted cash rejected");
+        check("100.10".equals(Money.money(FinanceRules.positiveMoney("100.1", "amount"))), "positive money normalized to 2dp");
+        check("1050.00".equals(Money.money(FinanceRules.creditAmount(null, "10", "105"))), "credit amount derived from litres × rate");
+        check("1050.00".equals(Money.money(FinanceRules.creditAmount("1050.00", "10", "105"))), "consistent credit amount accepted");
+        expectValidation(() -> FinanceRules.creditAmount("1049.99", "10", "105"), "inconsistent credit amount rejected");
+        expectValidation(() -> FinanceRules.creditAmount(null, "10", null), "quantity credit sale requires rate");
+        FinanceRules.Variances balanced = FinanceRules.reconciliation(new BigDecimal("1000"), new BigDecimal("1000.50"), new BigDecimal("500"), new BigDecimal("499.50"));
+        check(balanced.balanced() && "BALANCED".equals(balanced.status()), "reconciliation within ₹1 per channel is balanced");
+        FinanceRules.Variances offset = FinanceRules.reconciliation(new BigDecimal("1000"), new BigDecimal("900"), new BigDecimal("500"), new BigDecimal("600"));
+        check(!offset.balanced() && "VARIANCE".equals(offset.status()) && offset.displayed().compareTo(new BigDecimal("-100.00")) == 0,
+                "offsetting cash/digital errors never hide variance");
+        FinanceRules.Variances digitalOnly = FinanceRules.reconciliation(new BigDecimal("1000"), new BigDecimal("1000"), new BigDecimal("500"), new BigDecimal("520"));
+        check(!digitalOnly.balanced() && digitalOnly.digital().compareTo(new BigDecimal("20.00")) == 0, "digital-only variance detected independently");
+        check(Domain.signedLitres("DISPENSED", "10").compareTo(new BigDecimal("-10")) == 0, "dispensed stock sign negative");
+        check(Domain.signedLitres("ADJUSTMENT", "-5").compareTo(new BigDecimal("-5")) == 0, "adjustment preserves sign");
+        expectValidation(() -> Domain.signedLitres("UNKNOWN", "5"), "unknown stock movement type rejected");
+        Domain.DensityEvaluation density = Domain.evaluateDensityAt15c("DIESEL", "835.0", "15.0");
+        check(density.specificationUsed().contains("Uncertified") && density.specificationUsed().contains("not statutory compliance"),
+                "density label does not claim ASTM/IS compliance");
+    }
+
+    private static void expectValidation(Runnable action, String label) {
+        try {
+            action.run();
+            throw new AssertionError("Expected validation failure: " + label);
+        } catch (ApiException expected) {
+            check(expected.status == 422 || expected.status == 400, label);
         }
     }
 
@@ -791,7 +834,7 @@ public final class BackendTests {
                         && "-100.00".equals(offsetRow.get("variance")),
                 "Step 5: Offsetting cash (-100) and digital (+100) variances still flag status=VARIANCE");
 
-        // Re-save same business date with digital-only shortage (-80) -> updates same record idempotently
+        // Re-save same business date with digital-only shortage (-80) -> insert-only revision
         Map<String, Object> digShortRow = dataMap(post(client, url + "/finance/reconciliation", ownerToken, Web.map(
                 "stationId", stn2, "businessDate", bizDate, "cashCounted", "3300.00", "digitalSettled", "1820.00", "notes", "UPI short")));
         check("VARIANCE".equals(digShortRow.get("status"))
@@ -809,16 +852,17 @@ public final class BackendTests {
                 Web.map("note", "Again")).statusCode() == 409,
                 "Step 5: Duplicate reconciliation approval rejected (409)");
 
-        // Re-save same business date with exact balanced counts -> BALANCED and still 1 row for (stn2, bizDate)
+        // Re-save approved date with exact balanced counts -> new revision requires a reason.
         Map<String, Object> balRow = dataMap(post(client, url + "/finance/reconciliation", ownerToken, Web.map(
-                "stationId", stn2, "businessDate", bizDate, "cashCounted", "3300.00", "digitalSettled", "1900.00", "notes", "All settled")));
+                "stationId", stn2, "businessDate", bizDate, "cashCounted", "3300.00", "digitalSettled", "1900.00", "notes", "All settled",
+                "revisionReason", "Bank settlement confirmed after approval")));
         check("BALANCED".equals(balRow.get("status")) && "0.00".equals(balRow.get("variance")),
                 "Step 5: Matching cash and digital counts produce status=BALANCED and 0.00 variance");
 
         Map<String, Object> reconAfter = dataMap(get(client, url + "/finance/reconciliation?stationId=" + stn2 + "&businessDate=" + bizDate, ownerToken));
         List<Map<String, Object>> history = (List<Map<String, Object>>) reconAfter.get("history");
         long sameDayCount = history.stream().filter(h -> bizDate.equals(String.valueOf(h.get("businessDate")).substring(0, 10))).count();
-        check(sameDayCount == 1, "Step 5: Re-saving same business date updates in place without duplicating history rows");
+        check(sameDayCount == 3, "Step 5: Re-saving same business date preserves insert-only revision history");
 
         // Cross-station staff blocked from Station-2 reconciliation
         String stn1OnlyStaff = ensureStation1StaffToken(tenantId, stn1, List.of("reconciliation.read", "reconciliation.write"));
@@ -929,7 +973,7 @@ public final class BackendTests {
                         && "720".equals(petData.get("specMin"))
                         && "775".equals(petData.get("specMax"))
                         && ((Number) petData.get("withinSpec")).intValue() == 1
-                        && String.valueOf(petData.get("specificationUsed")).contains("IS 2796"),
+                        && String.valueOf(petData.get("specificationUsed")).contains("Petrol screening band (720–775 kg/m³)"),
                 "Step 7: Petrol 738.8 @ 31.0°C -> 753.0 kg/m³ @ 15°C (ASTM D1250 Table 53B, IS 2796 720–775 withinSpec=1)");
 
         // Diesel in-spec: 830.0 kg/m³ @ 30.5°C -> ASTM D1250 Table 53B = 840.7 kg/m³ (IS 1460:2017 810–845)
@@ -942,7 +986,7 @@ public final class BackendTests {
                         && "810".equals(dslData.get("specMin"))
                         && "845".equals(dslData.get("specMax"))
                         && ((Number) dslData.get("withinSpec")).intValue() == 1
-                        && String.valueOf(dslData.get("specificationUsed")).contains("IS 1460"),
+                        && String.valueOf(dslData.get("specificationUsed")).contains("Diesel screening band (810–845 kg/m³)"),
                 "Step 7: Diesel 830.0 @ 30.5°C -> 840.7 kg/m³ @ 15°C (ASTM D1250 Table 53B, IS 1460:2017 810–845 withinSpec=1)");
 
         // Adulterated / out-of-spec petrol (780.0 @ 28.0°C -> > 775 kg/m³) MUST record withinSpec=0 even if client sends withinSpec=true
@@ -1848,12 +1892,12 @@ public final class BackendTests {
         String getLubeSpec = densityGetRows.stream().filter(r -> lubeDnsId.equals(r.get("id"))).map(r -> String.valueOf(r.get("specificationUsed"))).findFirst().orElse("");
 
         check(postDieselSpec.equals(getDieselSpec)
-                        && getDieselSpec.contains("IS 1460:2017 BS-VI Diesel (810–845 kg/m³)")
+                        && getDieselSpec.contains("Diesel screening band (810–845 kg/m³)")
                         && !getDieselSpec.contains("860"),
-                "F-06: GET /density and POST /density agree on IS 1460:2017 BS-VI Diesel (810–845 kg/m³)");
+                "F-06: GET /density and POST /density agree on uncertified Diesel screening band (810–845 kg/m³)");
         check(postPetrolSpec.equals(getPetrolSpec)
-                        && getPetrolSpec.contains("IS 2796:2017 BS-VI Motor Gasoline (720–775 kg/m³)"),
-                "F-06: GET /density and POST /density agree on BS-VI Petrol (720–775 kg/m³)");
+                        && getPetrolSpec.contains("Petrol screening band (720–775 kg/m³)"),
+                "F-06: GET /density and POST /density agree on uncertified Petrol screening band (720–775 kg/m³)");
         check(postCngSpec.equals(getCngSpec)
                         && getCngSpec.contains("Unsupported fuel category")
                         && !getCngSpec.contains("Motor Gasoline")
