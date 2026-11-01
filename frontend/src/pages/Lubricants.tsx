@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Droplets, PackagePlus, Pencil, Plus, ShoppingCart, Truck } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatINR, formatNumber } from '../lib/format';
@@ -200,7 +201,9 @@ export default function Lubricants() {
         title="Lubricants & packaged oils"
         description={`${station?.name ?? 'Station'} · SKU pack inventory, counter sales & GST-inclusive pricing`}
         actions={
-          can('lubricants.write') ? (
+          <>
+            <ExportCsvButton path={`/lubricants?stationId=${stationId}`} filename="petroflow-lubricants" />
+            {can('lubricants.write') ? (
             <>
               <Button
                 variant="outline"
@@ -223,7 +226,8 @@ export default function Lubricants() {
                 Record sale
               </Button>
             </>
-          ) : undefined
+            ) : null}
+          </>
         }
       />
 
@@ -349,6 +353,7 @@ export default function Lubricants() {
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </Button>
+                            <DeleteRecordButton path={`/lubricants/${product.id}`} label={product.name} onDeleted={invalidate} />
                           </>
                         )}
                       </td>

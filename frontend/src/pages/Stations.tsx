@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Building2, MapPin, Pencil, Plus, Store } from 'lucide-react';
 import { apiGet, apiPatch, apiPost } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useAuth } from '../lib/auth';
 import {
   Badge,
@@ -91,11 +92,14 @@ export default function Stations() {
         title="Stations"
         description="Each station has its own tanks, dispensers, shifts, staff access and financial ledger. Data never crosses between stations or organizations."
         actions={
-          can('stations.write') ? (
-            <Button variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
-              <Plus className="h-4 w-4" /> New station
-            </Button>
-          ) : null
+          <>
+            <ExportCsvButton path="/catalog/stations" filename="petroflow-stations" />
+            {can('stations.write') ? (
+              <Button variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
+                <Plus className="h-4 w-4" /> New station
+              </Button>
+            ) : null}
+          </>
         }
       />
 
@@ -177,6 +181,7 @@ export default function Stations() {
                           <Pencil className="h-3.5 w-3.5" /> Edit
                         </Button>
                       ) : null}
+                      <DeleteRecordButton path={`/catalog/stations/${station.id}`} label={station.name} onDeleted={invalidate} />
                     </td>
                   </tr>
                 ))}

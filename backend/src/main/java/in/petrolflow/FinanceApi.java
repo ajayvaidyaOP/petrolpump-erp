@@ -32,6 +32,7 @@ public final class FinanceApi {
         web.post("/inventory/deliveries", FinanceApi::createDelivery);
         web.post("/inventory/deliveries/:id/receive", FinanceApi::receive);
         web.post("/inventory/deliveries/:id/dispute", FinanceApi::dispute);
+        web.delete("/inventory/deliveries/:id", FinanceApi::deleteDelivery);
         web.post("/inventory/adjustments", FinanceApi::adjustment);
         web.post("/inventory/opening-stock", FinanceApi::opening);
         web.post("/inventory/transfers", FinanceApi::transfer);
@@ -1364,6 +1365,25 @@ public final class FinanceApi {
             return loadShapedDelivery(id);
         });
         ctx.created(created);
+    }
+
+    private static void deleteDelivery(Web.Ctx ctx) {
+        Auth auth = ctx.requireAuth();
+        auth.require("deliveries.write");
+        auth.requireOwner();
+        Map<String, Object> existing = Db.one("SELECT * FROM deliveries WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Delivery not found");
+        String stationId = Db.str(existing, "station_id");
+        auth.station(stationId);
+        if (!"DRAFT".equals(Db.str(existing, "status"))) {
+            throw ApiException.conflict("Only draft deliveries can be deleted. Received deliveries already posted stock and payables.");
+        }
+        Db.tx(() -> {
+            Db.exec("DELETE FROM deliveries WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "DELIVERY_DELETED", "Delivery", Db.str(existing, "id"), stationId, "Owner deleted draft delivery", existing, null);
+            return null;
+        });
+        ctx.ok(Map.of("deleted", true));
     }
 
     private static void receive(Web.Ctx ctx) {

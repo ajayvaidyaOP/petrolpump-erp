@@ -1,3 +1,5 @@
+import { readStored, writeStored, removeStored, uuid } from './browser';
+
 export interface ApiErrorShape {
   code: string;
   message: string;
@@ -31,23 +33,15 @@ let previewSessionToken: string | null | undefined;
 
 function getPreviewSessionToken() {
   if (previewSessionToken !== undefined) return previewSessionToken;
-  try {
-    previewSessionToken = window.sessionStorage.getItem(PREVIEW_SESSION_KEY);
-  } catch {
-    previewSessionToken = null;
-  }
+  previewSessionToken = readStored(PREVIEW_SESSION_KEY, true);
   return previewSessionToken;
 }
 
 /** Keep the cookie-block fallback scoped to this browser tab and preview. */
 export function setPreviewSessionToken(token: string | null, persist = false) {
   previewSessionToken = token;
-  try {
-    if (persist && token) window.sessionStorage.setItem(PREVIEW_SESSION_KEY, token);
-    else window.sessionStorage.removeItem(PREVIEW_SESSION_KEY);
-  } catch {
-    // In-memory fallback still works for this page if storage is disabled.
-  }
+  if (persist && token) writeStored(PREVIEW_SESSION_KEY, token, true);
+  else removeStored(PREVIEW_SESSION_KEY, true);
 }
 
 interface ApiResponse<T> {
@@ -205,5 +199,5 @@ export function queryString(params: Record<string, string | number | boolean | n
 }
 
 export function idempotencyKey(prefix = 'ui') {
-  return `${prefix}-${crypto.randomUUID()}`;
+  return `${prefix}-${uuid()}`;
 }

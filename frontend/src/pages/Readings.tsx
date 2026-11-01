@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, Cpu, FlaskConical, PencilLine, RefreshCw, Radio } from 'lucide-react';
 import { apiGet, apiList, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatLitres, formatNumber, timeAgo } from '../lib/format';
 import {
@@ -148,6 +149,7 @@ export default function Readings() {
         description={`${station?.name ?? ''} · raw device snapshots and validated meter readings with quality status`}
         actions={
           <>
+            <ExportCsvButton path={`/readings?stationId=${stationId}`} filename="petroflow-readings" />
             <Button size="sm" variant="ghost" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => { void list.refetch(); if (can('devices.read')) void diagnostics.refetch(); }}>
               Refresh
             </Button>
@@ -273,7 +275,14 @@ export default function Readings() {
                       </td>
                       <td className="text-xs text-ink-400">{formatDateTime(reading.readingAt)}</td>
                       <td className="num text-xs text-ink-500">{reading.sequence}</td>
-                      <td className="text-xs text-ink-500">{reading.deviceName ?? '—'}</td>
+                      <td className="text-xs text-ink-500">
+                        <span className="inline-flex items-center gap-1">
+                          {reading.deviceName ?? '—'}
+                          {reading.source === 'MANUAL' && (
+                            <DeleteRecordButton path={`/readings/${reading.id}`} label="reading" onDeleted={() => void list.refetch()} />
+                          )}
+                        </span>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

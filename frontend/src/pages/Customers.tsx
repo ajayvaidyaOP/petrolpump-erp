@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { BookOpen, IndianRupee, Phone, Plus, Printer, Trash2, Truck, UserPlus, Users } from 'lucide-react';
 import { apiDelete, apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, formatNumber, todayIst } from '../lib/format';
@@ -172,11 +173,14 @@ export default function Customers() {
         title="Customers & credit ledger"
         description="Credit limits, outstanding balances, receipts and follow-up calls. Credit sales are never counted as cash received."
         actions={
-          can('customers.write') ? (
-            <Button size="sm" variant="primary" icon={<UserPlus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>
-              New customer
-            </Button>
-          ) : undefined
+          <>
+            <ExportCsvButton path="/catalog/customers" filename="petroflow-customers" />
+            {can('customers.write') ? (
+              <Button size="sm" variant="primary" icon={<UserPlus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>
+                New customer
+              </Button>
+            ) : null}
+          </>
         }
       />
 
@@ -247,6 +251,7 @@ export default function Customers() {
                           <div className="flex justify-end gap-1">
                             {can('reports.read') ? <Button size="sm" variant="ghost" onClick={() => setLedgerCustomer(customer)}>Ledger</Button> : can('sales.write') && <Button size="sm" variant="primary" onClick={() => { setLedgerCustomer(customer); setSaleOpen(true); }}>Credit slip</Button>}
                             {can('customers.write') && <Button size="sm" variant="ghost" onClick={() => setEditCustomer({ ...customer })}>Edit</Button>}
+                            <DeleteRecordButton path={`/catalog/customers/${customer.id}`} label={customer.name} onDeleted={invalidate} />
                           </div>
                         </td>
                       </tr>

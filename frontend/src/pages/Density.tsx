@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FlaskConical, Plus, RefreshCw, Thermometer, Trash2 } from 'lucide-react';
 import { apiDelete, apiList, apiPost, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatNumber, todayIst } from '../lib/format';
@@ -130,6 +131,7 @@ export default function Density() {
         description={`${station?.name ?? 'Station'} · Uncertified legacy 15°C density estimate and screening bands — not statutory compliance evidence`}
         actions={
           <>
+            <ExportCsvButton path={`/density?stationId=${stationId}&from=${from}&to=${to}`} filename="petroflow-density" />
             <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-auto" aria-label="From date" />
             <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="w-auto" aria-label="To date" />
             <Button size="sm" variant="ghost" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void checks.refetch()}>

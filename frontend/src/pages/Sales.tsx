@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Fuel, Gauge, ReceiptText } from 'lucide-react';
 import { apiGet } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatINR, formatLitres, formatNumber, todayIst } from '../lib/format';
 import {
@@ -176,9 +177,12 @@ export default function Sales() {
         title="Nozzle sales & meter history"
         description="Shift-derived nozzle sales and the immutable totalizer reading trail"
         actions={
-          <Field label="Business date" className="mb-0">
-            <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-auto" />
-          </Field>
+          <>
+            <ExportCsvButton path={`/readings?stationId=${stationId}`} filename="petroflow-meter-readings" label="Export readings" />
+            <Field label="Business date" className="mb-0">
+              <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-auto" />
+            </Field>
+          </>
         }
       />
 

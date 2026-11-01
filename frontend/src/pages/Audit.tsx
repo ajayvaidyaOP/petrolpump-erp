@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ScrollText, ShieldCheck } from 'lucide-react';
 import { apiList, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useStations } from '../lib/auth';
 import { formatDateTime } from '../lib/format';
 import {
@@ -66,6 +67,7 @@ export default function Audit() {
       <PageHeader
         title="Audit Log"
         description="Every sensitive change records who did it, from where, and the before/after values. Records are append-only."
+        actions={<ExportCsvButton path={`/audit?${params.toString()}`} filename="petroflow-audit" />}
       />
 
       <div className="mb-4 grid gap-3 sm:grid-cols-3">

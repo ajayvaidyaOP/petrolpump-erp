@@ -44,8 +44,10 @@ import { cn } from '../lib/utils';
 import { formatDate, initials, todayIst } from '../lib/format';
 import { Button, Field, Input, Modal, useToast } from './ui';
 import { NotificationCenter } from './NotificationCenter';
+import { RouteErrorBoundary } from './RouteErrorBoundary';
 import { CommandPalette } from './CommandPalette';
 import { apiPost } from '../lib/api';
+import { readStored, writeStored, mediaQuery } from '../lib/browser';
 
 const SIDEBAR_STORAGE_KEY = 'petroflow.sidebar-collapsed';
 
@@ -363,13 +365,7 @@ function HeaderShiftContext() {
 export function Layout() {
   const { me, logout } = useAuth();
   const { stations, station, selectStation } = useStations();
-  const [collapsed, setCollapsed] = useState<boolean>(() => {
-    try {
-      return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === '1';
-    } catch {
-      return false;
-    }
-  });
+  const [collapsed, setCollapsed] = useState<boolean>(() => readStored(SIDEBAR_STORAGE_KEY) === '1');
   const [mobileOpen, setMobileOpen] = useState(false);
   const [userMenu, setUserMenu] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
@@ -388,11 +384,7 @@ export function Layout() {
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
       const next = !prev;
-      try {
-        window.localStorage.setItem(SIDEBAR_STORAGE_KEY, next ? '1' : '0');
-      } catch {
-        /* ignore storage error */
-      }
+      writeStored(SIDEBAR_STORAGE_KEY, next ? '1' : '0');
       return next;
     });
   };
@@ -447,16 +439,16 @@ export function Layout() {
         first.focus();
       }
     };
-    const media = window.matchMedia('(min-width: 768px)');
+    const media = mediaQuery('(min-width: 768px)');
     const onDesktop = () => {
-      if (media.matches) setMobileOpen(false);
+      if (media?.matches) setMobileOpen(false);
     };
-    media.addEventListener('change', onDesktop);
+    media?.addEventListener('change', onDesktop);
     document.addEventListener('keydown', trap);
     return () => {
       document.body.style.overflow = previous;
       document.removeEventListener('keydown', trap);
-      media.removeEventListener('change', onDesktop);
+      media?.removeEventListener('change', onDesktop);
       previousFocus?.focus();
     };
   }, [mobileOpen]);
@@ -780,7 +772,9 @@ export function Layout() {
         >
           {!me?.isSuperAdmin && <SectionNav />}
           <div key={location.pathname} className="animate-fade-in">
-            <Outlet />
+            <RouteErrorBoundary resetKey={location.pathname}>
+              <Outlet />
+            </RouteErrorBoundary>
           </div>
         </main>
 

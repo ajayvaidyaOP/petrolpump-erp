@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ApiError, apiGet, apiPost, setPreviewSessionToken } from './api';
+import { readStored, writeStored } from './browser';
 
 export interface Station {
   id: string;
@@ -151,14 +152,14 @@ const StationContext = createContext<StationContextValue | null>(null);
 function StationProvider({ children }: { children: ReactNode }) {
   const { me } = useAuth();
   const stations = useMemo(() => me?.stations ?? [], [me]);
-  const [stationId, setStationId] = useState<string>(() => localStorage.getItem(STORAGE_KEY) ?? '');
+  const [stationId, setStationId] = useState<string>(() => readStored(STORAGE_KEY) ?? '');
 
   useEffect(() => {
     if (stations.length === 0) return;
     if (!stationId || !stations.some((s) => s.id === stationId)) {
       const next = stations[0].id;
       setStationId(next);
-      localStorage.setItem(STORAGE_KEY, next);
+      writeStored(STORAGE_KEY, next);
     }
   }, [stations, stationId]);
 
@@ -173,7 +174,7 @@ function StationProvider({ children }: { children: ReactNode }) {
 
   const selectStation = useCallback((id: string) => {
     setStationId(id);
-    localStorage.setItem(STORAGE_KEY, id);
+    writeStored(STORAGE_KEY, id);
     window.dispatchEvent(new CustomEvent('petroflow:station-changed', { detail: id }));
   }, []);
 

@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { readStored, writeStored } from './browser';
 
 export type Theme = 'dark' | 'light';
 
@@ -22,13 +23,8 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 /** Saved choice wins; new workspaces start in the dark Ember & Evergreen theme. */
 function initialTheme(): Theme {
-  if (typeof window === 'undefined') return 'dark';
-  try {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    return saved === 'light' || saved === 'dark' ? saved : 'dark';
-  } catch {
-    return 'dark';
-  }
+  const saved = readStored(STORAGE_KEY);
+  return saved === 'light' || saved === 'dark' ? saved : 'dark';
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
@@ -44,21 +40,13 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((next: Theme) => {
     setThemeState(next);
-    try {
-      window.localStorage.setItem(STORAGE_KEY, next);
-    } catch {
-      // The selected theme still applies for this visit if storage is unavailable.
-    }
+    writeStored(STORAGE_KEY, next);
   }, []);
 
   const toggleTheme = useCallback(() => {
     setThemeState((current) => {
       const next: Theme = current === 'dark' ? 'light' : 'dark';
-      try {
-        window.localStorage.setItem(STORAGE_KEY, next);
-      } catch {
-        // The selected theme still applies for this visit if storage is unavailable.
-      }
+      writeStored(STORAGE_KEY, next);
       return next;
     });
   }, []);

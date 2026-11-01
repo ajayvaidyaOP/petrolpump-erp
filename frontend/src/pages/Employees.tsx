@@ -6,6 +6,7 @@ import { apiGet, apiPatch, apiPost } from '../lib/api';
 import { useAuth, useStations } from '../lib/auth';
 import { initials } from '../lib/format';
 import { Badge, Button, Card, ErrorState, Field, Input, LoadingBlock, Modal, PageHeader, useToast } from '../components/ui';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { AttendancePanel } from '../components/AttendancePanel';
 
 interface Employee {
@@ -103,7 +104,7 @@ export default function Employees() {
       <PageHeader
         title="Your team"
         description="One owner. Add staff logins and tick exactly what each person can open."
-        actions={can('employees.write') ? <Button variant="primary" onClick={openCreate} icon={<Plus className="h-4 w-4" />}>Add staff login</Button> : undefined}
+        actions={<><ExportCsvButton path="/catalog/employees" filename="petroflow-staff" />{can('employees.write') ? <Button variant="primary" onClick={openCreate} icon={<Plus className="h-4 w-4" />}>Add staff login</Button> : null}</>}
       />
       {can('employees.read') && (employees.isLoading ? <LoadingBlock rows={6} /> : employees.isError ? <ErrorState error={employees.error} onRetry={() => void employees.refetch()} /> : (
         <>

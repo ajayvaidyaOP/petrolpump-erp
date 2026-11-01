@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CalendarClock, FileBadge2, Pencil, Plus, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
 import { COMPLIANCE_DOC_TYPES } from '@petroflow/shared';
 import { apiDelete, apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate } from '../lib/format';
 import {
@@ -130,9 +131,14 @@ export default function Compliance() {
       <PageHeader
         title="Licences & statutory compliance"
         description={`${station?.name ?? 'Station'} · PESO storage licence, Legal Metrology nozzle stamping, Fire NOC & pollution renewals`}
-        actions={can('compliance.write') ? (
-          <Button variant="primary" size="sm" icon={<Plus className="h-4 w-4" />} onClick={openCreate}>Add document</Button>
-        ) : undefined}
+        actions={
+          <>
+            <ExportCsvButton path={`/compliance?stationId=${stationId}`} arrayKey="documents" filename="petroflow-compliance" />
+            {can('compliance.write') ? (
+              <Button variant="primary" size="sm" icon={<Plus className="h-4 w-4" />} onClick={openCreate}>Add document</Button>
+            ) : null}
+          </>
+        }
       />
 
       <div className="grid gap-3 sm:grid-cols-3">
