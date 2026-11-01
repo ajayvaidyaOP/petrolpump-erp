@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Download, PackageCheck, Plus, Scale, Truck } from 'lucide-react';
 import { apiGet, apiList, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyTracker } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, formatNumber } from '../lib/format';
@@ -162,9 +163,12 @@ export default function Deliveries() {
         title="Supplier deliveries"
         description={`${station?.name ?? ''} · purchase invoices and tank receipts`}
         actions={
-          can('deliveries.write') ? (
-            <Button size="sm" variant="primary" icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>Record delivery</Button>
-          ) : undefined
+          <>
+            <ExportCsvButton path={`/inventory/deliveries?stationId=${stationId}`} filename="petroflow-deliveries" />
+            {can('deliveries.write') ? (
+              <Button size="sm" variant="primary" icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>Record delivery</Button>
+            ) : null}
+          </>
         }
       />
 
@@ -263,6 +267,9 @@ export default function Deliveries() {
                             )}
                             {can('deliveries.write') && delivery.status !== 'DISPUTED' && delivery.status !== 'RECEIVED' && (
                               <Button size="sm" variant="ghost" onClick={() => setDisputeDelivery(delivery)}>Dispute</Button>
+                            )}
+                            {delivery.status === 'DRAFT' && (
+                              <DeleteRecordButton path={`/inventory/deliveries/${delivery.id}`} label="draft delivery" onDeleted={invalidate} />
                             )}
                           </div>
                         </td>

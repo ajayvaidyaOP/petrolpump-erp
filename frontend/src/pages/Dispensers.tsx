@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fuel, Plus, Wrench } from 'lucide-react';
 import { apiGet, apiPatch, apiPost } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import {
   Badge,
@@ -177,11 +178,14 @@ export default function Dispensers() {
         title="Dispensers & Nozzles"
         description="Physical dispensing units and the nozzles that report totalizers. Nozzle totals are aggregate estimates — they never substitute for a tank dip."
         actions={
-          can('dispensers.write') ? (
-            <Button variant="primary" size="sm" onClick={() => setDispenserOpen(true)}>
-              <Plus className="h-4 w-4" /> Add dispenser
-            </Button>
-          ) : null
+          <>
+            <ExportCsvButton path={`/catalog/dispensers?stationId=${stationId}`} filename="petroflow-dispensers" />
+            {can('dispensers.write') ? (
+              <Button variant="primary" size="sm" onClick={() => setDispenserOpen(true)}>
+                <Plus className="h-4 w-4" /> Add dispenser
+              </Button>
+            ) : null}
+          </>
         }
       />
 
@@ -257,6 +261,7 @@ export default function Dispensers() {
                           >
                             {dispenser.status === 'ACTIVE' ? 'Maintenance' : 'Reactivate'}
                           </Button>
+                          <DeleteRecordButton path={`/catalog/dispensers/${dispenser.id}`} label={dispenser.name} onDeleted={invalidate} />
                         </>
                       ) : null}
                     </div>

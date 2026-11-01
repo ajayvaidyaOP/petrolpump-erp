@@ -13,15 +13,24 @@ public final class CatalogApi {
         web.get("/catalog/stations", CatalogApi::stations);
         web.post("/catalog/stations", CatalogApi::createStation);
         web.patch("/catalog/stations/:id", CatalogApi::patchStation);
+        web.delete("/catalog/stations/:id", ctx -> crudDelete(ctx, "stations", "stations.write", true, false,
+                new String[][]{{"shifts","station_id"},{"tanks","station_id"},{"dispensers","station_id"},{"expenses","station_id"},{"payments","station_id"},{"deliveries","station_id"}},
+                new String[]{}));
         web.get("/catalog/products", ctx -> crudList(ctx, "fuel_products", "products.read", true, false, "code", "name"));
         web.post("/catalog/products", ctx -> crudCreate(ctx, "fuel_products", "prd", "products.write", true, false, "code", "name", "category", "unit", "color", "isActive"));
         web.patch("/catalog/products/:id", ctx -> crudPatch(ctx, "fuel_products", "products.write", true, "name", "category", "unit", "color", "isActive"));
+        web.delete("/catalog/products/:id", ctx -> crudDelete(ctx, "fuel_products", "products.write", true, false,
+                new String[][]{{"fuel_prices","product_id"},{"tanks","product_id"},{"nozzles","product_id"},{"deliveries","product_id"},{"fuel_transactions","product_id"},{"stock_movements","product_id"},{"density_checks","product_id"}},
+                new String[]{}));
         web.get("/catalog/prices", CatalogApi::prices);
         web.get("/catalog/prices/current", CatalogApi::currentPrices);
         web.post("/catalog/prices", CatalogApi::createPrice);
         web.get("/catalog/tanks", ctx -> crudList(ctx, "tanks", "tanks.read", false, true, "code", "name"));
         web.post("/catalog/tanks", CatalogApi::createTank);
         web.patch("/catalog/tanks/:id", CatalogApi::patchTank);
+        web.delete("/catalog/tanks/:id", ctx -> crudDelete(ctx, "tanks", "tanks.write", false, true,
+                new String[][]{{"stock_movements","tank_id"},{"tank_measurements","tank_id"},{"deliveries","tank_id"},{"nozzles","tank_id"},{"density_checks","tank_id"}},
+                new String[]{"tank_calibration_points"}));
         web.get("/catalog/tanks/:id/calibration", CatalogApi::getCalibration);
         web.put("/catalog/tanks/:id/calibration", CatalogApi::putCalibration);
         web.get("/catalog/tanks/:id/measurements", CatalogApi::listMeasurements);
@@ -29,22 +38,33 @@ public final class CatalogApi {
         web.get("/catalog/dispensers", ctx -> crudList(ctx, "dispensers", "dispensers.read", false, true, "code", "name"));
         web.post("/catalog/dispensers", ctx -> crudCreate(ctx, "dispensers", "dsp", "dispensers.write", false, true, "code", "name", "serialNumber", "model", "protocol", "status"));
         web.patch("/catalog/dispensers/:id", ctx -> crudPatch(ctx, "dispensers", "dispensers.write", false, "name", "model", "serialNumber", "protocol", "status"));
+        web.delete("/catalog/dispensers/:id", ctx -> crudDelete(ctx, "dispensers", "dispensers.write", false, true,
+                new String[][]{{"nozzles","dispenser_id"}}, new String[]{}));
         web.get("/catalog/nozzles", ctx -> crudList(ctx, "nozzles", "dispensers.read", false, true, "label", "number"));
         web.post("/catalog/nozzles", CatalogApi::createNozzle);
         web.patch("/catalog/nozzles/:id", CatalogApi::patchNozzle);
+        web.delete("/catalog/nozzles/:id", ctx -> crudDelete(ctx, "nozzles", "dispensers.write", false, true,
+                new String[][]{{"shift_nozzle_readings","nozzle_id"},{"meter_readings","nozzle_id"},{"fuel_transactions","nozzle_id"}}, new String[]{}));
         web.get("/catalog/nozzles/:id/history", CatalogApi::nozzleHistory);
         web.get("/catalog/customers", ctx -> customers(ctx, "code", "name", "phone"));
         web.post("/catalog/customers", ctx -> crudCreate(ctx, "customers", "cus", "customers.write", true, false, "code", "name", "phone", "email", "gstin", "address", "creditLimit", "creditDays", "status"));
         web.patch("/catalog/customers/:id", ctx -> crudPatch(ctx, "customers", "customers.write", true, "name", "phone", "email", "gstin", "address", "creditLimit", "creditDays", "status"));
+        web.delete("/catalog/customers/:id", ctx -> crudDelete(ctx, "customers", "customers.write", true, false,
+                new String[][]{{"credit_entries","customer_id"},{"payments","customer_id"},{"fuel_transactions","customer_id"},{"lube_movements","customer_id"}},
+                new String[]{"customer_vehicles","customer_followups"}));
         web.get("/catalog/customers/:id/vehicles", CatalogApi::vehicles);
         web.post("/catalog/customers/:id/vehicles", CatalogApi::addVehicle);
         web.delete("/catalog/customers/:id/vehicles/:vehicleId", CatalogApi::deleteVehicle);
         web.get("/catalog/suppliers", ctx -> suppliers(ctx, "code", "name", "phone", "gstin"));
         web.post("/catalog/suppliers", ctx -> crudCreate(ctx, "suppliers", "sup", "suppliers.write", true, false, "code", "name", "contactPerson", "phone", "email", "gstin", "address", "creditDays", "openingBalance", "isActive"));
         web.patch("/catalog/suppliers/:id", ctx -> crudPatch(ctx, "suppliers", "suppliers.write", true, "name", "contactPerson", "phone", "email", "gstin", "address", "creditDays", "isActive"));
+        web.delete("/catalog/suppliers/:id", ctx -> crudDelete(ctx, "suppliers", "suppliers.write", true, false,
+                new String[][]{{"deliveries","supplier_id"},{"payments","supplier_id"},{"lube_movements","supplier_id"}}, new String[]{}));
         web.get("/catalog/expense-categories", ctx -> crudList(ctx, "expense_categories", "expenses.read", true, false, "name"));
         web.post("/catalog/expense-categories", ctx -> crudCreate(ctx, "expense_categories", "exc", "expenses.write", true, false, "name", "isActive"));
         web.patch("/catalog/expense-categories/:id", ctx -> crudPatch(ctx, "expense_categories", "expenses.write", true, "name", "isActive"));
+        web.delete("/catalog/expense-categories/:id", ctx -> crudDelete(ctx, "expense_categories", "expenses.write", true, false,
+                new String[][]{{"expenses","category_id"}}, new String[]{}));
         web.get("/catalog/employees", CatalogApi::employees);
         web.post("/catalog/employees", CatalogApi::createEmployee);
         web.patch("/catalog/employees/:id", CatalogApi::patchEmployee);
@@ -1105,6 +1125,53 @@ public final class CatalogApi {
             shaped.put("openingBalance", auth.allStations ? Money.money(shaped.get("openingBalance")) : "0.00");
         }
         ctx.ok(shaped);
+    }
+
+    /**
+     * Owner-only hard delete for master data. Refuses when the row is referenced by
+     * operational/financial history (so ledgers and stock never orphan), and cascades
+     * only pure configuration children. Station-scoped and strictly audited.
+     */
+    private static void crudDelete(Web.Ctx ctx, String table, String permission, boolean tenant, boolean station,
+                                   String[][] references, String[] cascadeChildren) {
+        Auth auth = ctx.requireAuth();
+        auth.require(permission);
+        auth.requireOwner();
+        Map<String, Object> existing = Db.one("SELECT * FROM " + table + " WHERE id = ?", ctx.p("id"));
+        if (existing == null) throw ApiException.notFound("Record not found");
+        if (tenant && !auth.tenantId().equals(Db.str(existing, "tenant_id"))) throw ApiException.notFound("Record not found");
+        String stationId = null;
+        if (station && existing.get("station_id") != null) {
+            stationId = Db.str(existing, "station_id");
+            auth.station(stationId);
+        }
+        if ("stations".equals(table)) stationId = Db.str(existing, "id");
+        for (String[] ref : references) {
+            long used = Db.count("SELECT COUNT(*) AS count FROM " + ref[0] + " WHERE " + ref[1] + " = ?", existing.get("id"));
+            if (used > 0) {
+                throw ApiException.conflict("Cannot delete: this record is used by " + used + " " + ref[0].replace('_', ' ')
+                        + " row(s). Deactivate/archive it instead of deleting so history stays intact.");
+            }
+        }
+        final String auditStation = stationId;
+        Db.tx(() -> {
+            for (String child : cascadeChildren) {
+                Db.exec("DELETE FROM " + child + " WHERE " + ("stations".equals(table) ? "station_id" : parentColumn(child)) + " = ?", existing.get("id"));
+            }
+            Db.exec("DELETE FROM " + table + " WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "MASTER_DELETED", table, Db.str(existing, "id"), auditStation,
+                    "Owner deleted " + table + " " + Db.str(existing, "id"), existing, null);
+            return null;
+        });
+        ctx.ok(Map.of("deleted", true));
+    }
+
+    private static String parentColumn(String childTable) {
+        return switch (childTable) {
+            case "customer_vehicles", "customer_followups" -> "customer_id";
+            case "tank_calibration_points" -> "tank_id";
+            default -> "parent_id";
+        };
     }
 
     private static Object valueOf(String field, Object value) {

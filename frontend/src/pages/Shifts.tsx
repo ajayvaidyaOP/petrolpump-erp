@@ -3,12 +3,12 @@ import { useIdempotencyTracker } from '../lib/idempotency';
 import { useSearchParams } from 'react-router-dom';
 import { CASH_DENOMINATIONS } from '@petroflow/shared';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CalendarDays, CheckCircle2, Clock, Download, Plus, RefreshCw, SlidersHorizontal, Undo2 } from 'lucide-react';
+import { CalendarDays, CheckCircle2, Clock, Plus, RefreshCw, SlidersHorizontal, Undo2 } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import { unclosedShiftMessage, type ShiftAlertsResponse } from '../lib/shifts';
 import { formatDateTime, formatINR, formatLitres, formatNumber, todayIst } from '../lib/format';
-import { downloadCsv } from '../lib/utils';
 import {
   Badge,
   TableScrollHint,
@@ -268,29 +268,7 @@ export default function Shifts() {
         description={`${station?.name ?? ''} · opening and closing totalizers, variance review and approvals`}
         actions={
           <>
-            <Button
-              size="sm"
-              variant="ghost"
-              icon={<Download className="h-3.5 w-3.5" />}
-              onClick={() =>
-                downloadCsv(
-                  `shifts-${todayIst()}.csv`,
-                  rows.map((r) => ({
-                    shift: r.shiftNumber,
-                    date: r.businessDate,
-                    status: r.status,
-                    operator: r.operatorName ?? '',
-                    litres: r.totalLitres,
-                    value: r.totalValue,
-                    opened: r.openedAt,
-                    closed: r.closedAt ?? '',
-                  })),
-                )
-              }
-              disabled={rows.length === 0}
-            >
-              Export
-            </Button>
+            <ExportCsvButton path={`/shifts?stationId=${stationId}`} filename="petroflow-shifts" />
             <Button size="sm" variant="ghost" icon={<RefreshCw className="h-3.5 w-3.5" />} onClick={() => void list.refetch()}>
               Refresh
             </Button>

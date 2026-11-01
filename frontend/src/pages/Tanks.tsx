@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeftRight, Database, Droplets, Gauge, Plus, Ruler } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyTracker } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, formatINR, formatLitres, formatNumber } from '../lib/format';
@@ -181,6 +182,7 @@ export default function Tanks() {
         description={`${station?.name ?? ''} · book stock from the movement ledger, physical dips recorded separately`}
         actions={
           <>
+            <ExportCsvButton path={`/catalog/tanks?stationId=${stationId}`} filename="petroflow-tanks" />
             {can('stock.write') && (
               <>
                 <Button size="sm" variant="secondary" icon={<ArrowLeftRight className="h-4 w-4" />} onClick={() => setTransferOpen(true)}>Transfer</Button>
@@ -343,6 +345,7 @@ export default function Tanks() {
                     )}
                     <Button size="sm" variant="ghost" onClick={() => setLedgerTank(tank)}>Ledger</Button>
                     {can('tanks.write') && <Button size="sm" variant="ghost" onClick={() => setEditTank(tank)}>Edit</Button>}
+                    <DeleteRecordButton path={`/catalog/tanks/${tank.id}`} label={tank.name} onDeleted={invalidate} />
                   </div>
                 </Card>
                 );

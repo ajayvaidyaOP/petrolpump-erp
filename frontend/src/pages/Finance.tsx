@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDownLeft, ArrowUpRight, Banknote, Plus, Receipt, RotateCcw, Wallet } from 'lucide-react';
 import { apiDelete, apiGet, apiGetWithMeta, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, todayIst } from '../lib/format';
@@ -194,6 +195,8 @@ export default function Finance() {
         description={`${station?.name ?? ''} · collections, supplier payouts, expenses and settlement tracking`}
         actions={
           <>
+            <ExportCsvButton path={`/finance/payments?stationId=${stationId}&businessDate=${date}`} filename="petroflow-payments" />
+            <ExportCsvButton path={`/finance/expenses?stationId=${stationId}&businessDate=${date}`} filename="petroflow-expenses" label="Expenses CSV" />
             <Field label="Business date" className="mb-0">
               <Input type="date" value={date} onChange={(e) => { setDate(e.target.value); setPage(1); }} className="w-auto" />
             </Field>

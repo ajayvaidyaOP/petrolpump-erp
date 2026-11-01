@@ -34,8 +34,10 @@ public final class OpsApi {
         web.get("/lubricants", OpsApi::lubricants);
         web.post("/lubricants", OpsApi::addLubricant);
         web.patch("/lubricants/:id", OpsApi::patchLubricant);
+        web.delete("/lubricants/:id", OpsApi::deleteLubricant);
         web.get("/lubricants/movements", OpsApi::lubeMovements);
         web.post("/lubricants/movements", OpsApi::addLubeMovement);
+        web.delete("/lubricants/movements/:id", OpsApi::deleteLubeMovement);
         web.get("/devices", OpsApi::devices);
         web.get("/devices/:id/events", OpsApi::deviceEvents);
         web.post("/devices", OpsApi::addDevice);
@@ -45,6 +47,7 @@ public final class OpsApi {
         web.get("/hardware/diagnostics", OpsApi::hardwareDiagnostics);
         web.get("/readings", OpsApi::readings);
         web.post("/readings/manual", OpsApi::manualReading);
+        web.delete("/readings/:id", OpsApi::deleteReading);
         web.post("/demo/simulate", OpsApi::simulate);
         web.post("/gateway/heartbeat", OpsApi::gatewayHeartbeat);
         web.post("/gateway/events", OpsApi::gatewayEvents);
@@ -604,6 +607,64 @@ public final class OpsApi {
         auth.station(Db.str(existing, "station_id"));
         Db.exec("DELETE FROM compliance_documents WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
         Auth.auditRequired(auth, "COMPLIANCE_DELETED", "ComplianceDocument", ctx.p("id"), Db.str(existing, "station_id"), "Deleted compliance document", existing, null);
+        ctx.ok(Map.of("deleted", true));
+    }
+
+    private static void deleteLubricant(Web.Ctx ctx) {
+        Auth auth = ctx.requireAuth();
+        auth.require("lubricants.write");
+        auth.requireOwner();
+        Map<String, Object> existing = Db.one("SELECT * FROM lube_products WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Lubricant SKU not found");
+        long used = Db.count("SELECT COUNT(*) AS count FROM lube_movements WHERE product_id = ?", existing.get("id"));
+        if (used > 0) throw ApiException.conflict("Cannot delete: this SKU has " + used + " stock movement(s). Deactivate it instead.");
+        Db.tx(() -> {
+            Db.exec("DELETE FROM lube_products WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "MASTER_DELETED", "lube_products", Db.str(existing, "id"), null, "Owner deleted lubricant SKU", existing, null);
+            return null;
+        });
+        ctx.ok(Map.of("deleted", true));
+    }
+
+    private static void deleteLubeMovement(Web.Ctx ctx) {
+        Auth auth = ctx.requireAuth();
+        auth.require("lubricants.write");
+        auth.requireOwner();
+        Map<String, Object> existing = Db.one("SELECT * FROM lube_movements WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Lubricant movement not found");
+        String stationId = Db.str(existing, "station_id");
+        auth.station(stationId);
+        String type = Db.str(existing, "type");
+        if ("SALE".equals(type) || "PURCHASE".equals(type)) {
+            throw ApiException.conflict("Sales/purchases cannot be deleted because they affect stock and accounts. Record a correcting adjustment instead.");
+        }
+        Domain.assertDayOpen(stationId, Clock.businessDateOf(Db.str(existing, "occurred_at")));
+        Db.tx(() -> {
+            Db.exec("DELETE FROM lube_movements WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "LUBE_MOVEMENT_DELETED", "lube_movements", Db.str(existing, "id"), stationId, "Owner deleted lubricant " + type, existing, null);
+            return null;
+        });
+        ctx.ok(Map.of("deleted", true));
+    }
+
+    private static void deleteReading(Web.Ctx ctx) {
+        Auth auth = ctx.requireAuth();
+        auth.require("readings.manual");
+        auth.requireOwner();
+        Map<String, Object> existing = Db.one("SELECT * FROM meter_readings WHERE id = ? AND tenant_id = ?", ctx.p("id"), auth.tenantId());
+        if (existing == null) throw ApiException.notFound("Reading not found");
+        String stationId = Db.str(existing, "station_id");
+        auth.station(stationId);
+        if (!"MANUAL".equals(Db.str(existing, "source"))) {
+            throw ApiException.conflict("Only manually entered readings can be deleted. Device/simulated readings are immutable.");
+        }
+        long used = Db.count("SELECT COUNT(*) AS count FROM shift_nozzle_readings WHERE opening_reading_id = ? OR closing_reading_id = ?", existing.get("id"), existing.get("id"));
+        if (used > 0) throw ApiException.conflict("This reading is used by a shift and cannot be deleted.");
+        Db.tx(() -> {
+            Db.exec("DELETE FROM meter_readings WHERE id = ?", existing.get("id"));
+            Auth.auditRequired(auth, "READING_DELETED", "meter_readings", Db.str(existing, "id"), stationId, "Owner deleted manual reading", existing, null);
+            return null;
+        });
         ctx.ok(Map.of("deleted", true));
     }
 

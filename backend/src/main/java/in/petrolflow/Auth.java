@@ -35,6 +35,13 @@ public final class Auth {
         if (!can(permission)) throw ApiException.forbidden("Missing permission: " + permission);
     }
 
+    /** Destructive master-data deletion is reserved for the organization owner. */
+    public void requireOwner() {
+        if (!"OWNER".equals(roleKey)) {
+            throw ApiException.forbidden("Only the organization owner can delete records");
+        }
+    }
+
     public String tenantId() {
         if (tenantId == null) throw ApiException.forbidden("Platform administrators cannot access organization data through station endpoints");
         return tenantId;

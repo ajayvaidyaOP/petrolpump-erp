@@ -28,6 +28,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { uuid } from '../lib/browser';
 
 /* ------------------------------------------------------------------ button */
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success' | 'outline';
@@ -653,7 +654,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const toast = useCallback(
     (title: string, options?: { description?: string; tone?: Toast['tone'] }) => {
-      const id = crypto.randomUUID();
+      const id = uuid();
       setToasts((current) => [
         ...current.slice(-3),
         { id, title, description: options?.description, tone: options?.tone ?? 'success' },

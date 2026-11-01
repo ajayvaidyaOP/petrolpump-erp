@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Activity, Copy, HardDrive, KeyRound, Plus, RefreshCw, Radio, TriangleAlert, Zap } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { ExportCsvButton } from '../components/OwnerActions';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDateTime, timeAgo } from '../lib/format';
 import {
@@ -181,6 +182,7 @@ export default function Devices() {
         description="Hardware gateways authenticate with a device key, buffer locally and push idempotent events. This screen shows liveness, credential versions and raw event delivery."
         actions={
           <div className="flex flex-wrap gap-2">
+            <ExportCsvButton path={`/devices?stationId=${stationId}`} filename="petroflow-devices" />
             {me?.demoMode && can('devices.write') && simulated > 0 ? (
               <Button size="sm" variant="outline" loading={simulate.isPending} onClick={() => simulate.mutate()}>
                 <Zap className="h-4 w-4" /> Inject simulated reading

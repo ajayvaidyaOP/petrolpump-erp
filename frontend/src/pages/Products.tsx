@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fuel, Pencil, Plus, Tags, TrendingUp } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
 import { useAuth, useStations } from '../lib/auth';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { formatDateTime, formatINR } from '../lib/format';
 import {
   Badge,
@@ -140,11 +141,14 @@ export default function Products() {
         title="Products & Prices"
         description="Fuel grades, units and effective-dated prices. Every sale is valued with the price in force at the time of the transaction — never a later price."
         actions={
-          can('products.write') ? (
-            <Button variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
-              <Plus className="h-4 w-4" /> New product
-            </Button>
-          ) : null
+          <>
+            <ExportCsvButton path="/catalog/products" filename="petroflow-products" />
+            {can('products.write') ? (
+              <Button variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
+                <Plus className="h-4 w-4" /> New product
+              </Button>
+            ) : null}
+          </>
         }
       />
 
@@ -248,6 +252,11 @@ export default function Products() {
                                   <Pencil className="h-3.5 w-3.5" />
                                 </Button>
                               ) : null}
+                              <DeleteRecordButton
+                                path={`/catalog/products/${product.id}`}
+                                label={product.name}
+                                onDeleted={invalidate}
+                              />
                             </div>
                           </td>
                         </tr>

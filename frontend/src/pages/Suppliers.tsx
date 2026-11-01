@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Banknote, BookOpen, Plus, Truck } from 'lucide-react';
 import { apiGet, apiList, apiPatch, apiPost, type ListMeta } from '../lib/api';
+import { DeleteRecordButton, ExportCsvButton } from '../components/OwnerActions';
 import { useIdempotencyKey } from '../lib/idempotency';
 import { useAuth, useStations } from '../lib/auth';
 import { formatDate, formatDateTime, formatINR, todayIst } from '../lib/format';
@@ -146,9 +147,12 @@ export default function Suppliers() {
         title="Suppliers & payables"
         description="Fuel suppliers, purchase invoices and payout history. Payables are computed from received deliveries less payouts."
         actions={
-          can('suppliers.write') ? (
-            <Button size="sm" variant="primary" icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>New supplier</Button>
-          ) : undefined
+          <>
+            <ExportCsvButton path="/catalog/suppliers" filename="petroflow-suppliers" />
+            {can('suppliers.write') ? (
+              <Button size="sm" variant="primary" icon={<Plus className="h-4 w-4" />} onClick={() => setCreateOpen(true)}>New supplier</Button>
+            ) : null}
+          </>
         }
       />
 
@@ -196,6 +200,7 @@ export default function Suppliers() {
                         <div className="flex justify-end gap-1">
                           <Button size="sm" variant="ghost" onClick={() => setLedgerSupplier(supplier)}>Ledger</Button>
                           {can('suppliers.write') && <Button size="sm" variant="ghost" onClick={() => setEditSupplier({ ...supplier })}>Edit</Button>}
+                          <DeleteRecordButton path={`/catalog/suppliers/${supplier.id}`} label={supplier.name} onDeleted={invalidate} />
                         </div>
                       </td>
                     </tr>

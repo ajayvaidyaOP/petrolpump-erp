@@ -1,8 +1,63 @@
 # PetroFlow ERP audit / fix report
 
-Date: 2026-11-01  
-Branch: `arena/b54884a6-petrolflow-erp`  
-Status: **PARTIAL — source fixes applied and statically/pure-unit verified; client-demo acceptance is BLOCKED**
+Date: 2026-11-01\
+Branch: `arena/cbc52c3a-petrolflow-erp`\
+Status: **PARTIAL — render crash fixed and verified in a real browser; owner delete/export added; client-demo data acceptance still BLOCKED on staging access**
+
+## 0. Latest pass — crash fix, owner delete & download-everywhere (verified in Chromium)
+
+The deployed app was showing the app-wide `AppErrorBoundary` ("This screen could not be
+displayed") and **no buttons worked**. Root causes were confirmed in source and then
+**reproduced and re-tested in a real headless Chromium browser**:
+
+1. **Render-time `crypto.randomUUID()`** — `idempotencyKey()` (api.ts) and every toast id
+   (ui.tsx) called `crypto.randomUUID()`, which is `undefined` on plain-HTTP deployments.
+   `useIdempotencyKey` generates the key during render, so the throw replaced the entire
+   app with the error boundary and killed all navigation.
+2. **Unguarded `localStorage`/`sessionStorage`** — `StationProvider`, theme and layout
+   read/wrote storage directly; sandboxed/preview iframes throw `SecurityError` on access.
+3. **One app-wide boundary** — any single page render throw took down the whole shell.
+
+Fixes:
+
+- New `frontend/src/lib/browser.ts`: `readStored/writeStored/removeStored` (probe +
+  in-memory fallback), `uuid()` (randomUUID → getRandomValues → Math.random, RFC4122
+  shaped), and null-safe `mediaQuery()`. Rewired auth, theme, layout, api and toast ids to
+  these helpers. **No raw `crypto.randomUUID` or unguarded storage remains** (grep-verified).
+- New `frontend/src/components/RouteErrorBoundary.tsx` wraps the routed `<Outlet/>`, keyed
+  by pathname, so a single screen failure keeps the sidebar/station switcher/navigation
+  alive and offers "Try again" / "Back to overview" with the real error message.
+- **Owner-only delete** (`Auth.requireOwner()` + reference-guarded `CatalogApi.crudDelete`,
+  plus OpsApi/FinanceApi deletes): products, stations, tanks, dispensers, nozzles,
+  customers, suppliers, expense categories, lubricant SKUs, lubricant adjustments/opening,
+  manual meter readings, and draft deliveries. Deletes refuse (HTTP 409) when a row is
+  referenced by sales/stock/ledger history, cascade only pure config children, are
+  station-scoped, and write an audit row. Financial postings are never hard-deleted.
+- **Download everywhere**: reusable `ExportCsvButton` pages through `apiList` (or reads an
+  `arrayKey` for object responses) and exports the full filtered dataset, with honest
+  "nothing to export" feedback. Wired into Products, Stations, Dispensers, Tanks,
+  Customers, Suppliers, Employees, Lubricants, Deliveries, Density, Devices, Finance
+  (payments + expenses), Compliance, Shifts, Sales, Readings and Audit. `DeleteRecordButton`
+  is hidden for every non-owner role.
+
+Verification (this pass):
+
+- Backend ECJ compile **PASS** (16 warnings); `SKIP_DB_TESTS=true` harness **38 PASS**.
+- Frontend typecheck **PASS**; production build **PASS**.
+- **Real Chromium regression suite** (`playwright.crash.config.ts`, backend mocked, no
+  MySQL): with `crypto.randomUUID` disabled **and** storage throwing `SecurityError`,
+  **0 global crashes across all 22 routes**, no uncaught page errors, navigation shell
+  always alive. Owner delete buttons open a confirmation and fire a real `DELETE` + success
+  toast; Export CSV downloads verified (e.g. `petroflow-products.csv`,
+  `petroflow-stations.csv`). Committed specs: `frontend/e2e/crash-resilience.spec.ts`
+  (**2 passed**). Run: `npx playwright install chromium && npx playwright test --config
+  playwright.crash.config.ts`.
+- A standalone harness additionally booted all 22 routes; 7 data-heavy screens hit the
+  *route-level* boundary only because the mock returned incomplete nested objects — the
+  shell stayed usable, confirming isolation. Those are mock gaps, not app defects.
+
+Still blocked / not claimed: live staging MySQL, demo-data insertion, and the destructive
+HTTP/DB integration suite (see sections below).
 
 ## 1. Executive status
 
